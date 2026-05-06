@@ -415,4 +415,4 @@ claude mcp remove --scope user bitrise-dev-environments >/dev/null 2>&1 || true
 claude mcp remove --scope user qa-agent >/dev/null 2>&1 || true
 claude mcp add --scope user qa-agent -- "$QA_AGENT_BIN" mcp
 
-log "warmup complete (UDID=$UDID)"
+log "warmup complete; simctl create still running in background (UDID will land in $UDID_FILE)"
