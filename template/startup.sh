@@ -41,7 +41,10 @@ if [ "$(uname)" != "Darwin" ]; then
 fi
 
 # Match warmup.sh: pick the same Xcode for every simctl call so the version
-# the simulator was created against is the version we boot it with.
+# the simulator was created against is the version we boot it with. Bitrise
+# images install Xcode under /Applications/Xcode-${MAJOR.MINOR.PATCH}.app —
+# fall back to a `Xcode-${MAJOR.MINOR}.*.app` glob so a request like "26.3"
+# resolves to "Xcode-26.3.0.app" (highest patch wins).
 XCODE_PATH=""
 for _candidate in \
   "/Applications/Xcode-${XCODE_VERSION}.app" \
@@ -51,7 +54,10 @@ for _candidate in \
   fi
 done
 if [ -z "$XCODE_PATH" ]; then
-  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app" >&2
+  XCODE_PATH="$(ls -d "/Applications/Xcode-${XCODE_VERSION}".*.app 2>/dev/null | sort -V | tail -n 1)"
+fi
+if [ -z "$XCODE_PATH" ] || [ ! -d "$XCODE_PATH" ]; then
+  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app or /Applications/Xcode-${XCODE_VERSION}.*.app" >&2
   exit 1
 fi
 export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
