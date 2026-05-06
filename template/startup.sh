@@ -3,25 +3,29 @@
 # Bitrise QA Agent — RDE template startup script.
 # Runs on EVERY session start (initial provisioning + every restart of an
 # archived session). Sits between `claudeAISetup` (refresh creds) and the
-# backend's terminal sleep loop. Note: claudeAIAutoStart only runs in the
-# warmup phase, so this script does not (re)launch Claude itself.
+# backend's terminal sleep loop.
 #
 # Performed work:
 #   1. Boot the simulator created by warmup.sh.
-#   2. Wait for it to be fully ready.
-#   3. Publish a known-path manifest the AI prompt can read to learn the
-#      simulator UDID and the session_id (needed by bitrise-dev-environments
-#      MCP tools to target *this* session).
+#   2. Publish a known-path manifest with { udid, session_id, workspace_id }
+#      so MCP tools and the prompt can target *this* session.
+#   3. Fork the upload watcher (installed by warmup.sh): it blocks until the
+#      CLI's `--upload` lands in /tmp, then launches Claude in tmux with
+#      $QA_PROMPT. We do NOT use the codespaces backend's claudeAIAutoStart
+#      path here — that fires immediately at warmup with $AI_PROMPT, which
+#      means Claude burns tokens polling for the file from inside its own
+#      loop. Instead, the CLI passes the prompt as a $QA_PROMPT session input
+#      (with expose_as_env_var=true) and we launch Claude only once there's
+#      something to act on.
 #
-# The AI prompt should look something like:
+# The QA_PROMPT should look something like:
 #
-#   You are a QA tester. Wait until /tmp/<file> exists.
-#   When it does:
-#     - Read /tmp/.qa-agent-info.json for { udid, session_id, workspace_id }.
-#     - Install: xcrun simctl install <udid> /tmp/<file>
-#     - Launch the app, then drive it with the bitrise-dev-environments MCP
-#       tools (screenshot, click, scroll) against session_id to verify <task>.
-#     - Report results, then exit.
+#   You are a QA tester. The app is at $(cat ~/.qa-agent/upload-path).
+#   Read /tmp/.qa-agent-info.json for { udid, session_id, workspace_id }.
+#   Install: xcrun simctl install <udid> <upload-path>
+#   Launch the app, then drive it with the bitrise-dev-environments MCP
+#   tools (screenshot, click, scroll) against session_id to verify <task>.
+#   Report results, then exit.
 
 set -euo pipefail
 
@@ -111,3 +115,27 @@ print(json.dumps({
 PY
 
 log "simulator ready (UDID=$UDID); manifest at $INFO_FILE"
+
+# ---------- Fork the upload watcher ----------------------------------------
+# Detached from this script's process tree (setsid + nohup) so it survives
+# after startup.sh returns and the parent inner-script transitions into
+# `sleep 2147483647`. The watcher inherits QA_PROMPT and PATH from this env.
+
+WATCHER="$HOME/.qa-agent/watcher.sh"
+if [ -z "${QA_PROMPT:-}" ]; then
+  log "WARN: QA_PROMPT not set — watcher will not be started; the session will"
+  log "      reach RUNNING but no Claude run will fire on upload."
+elif [ ! -x "$WATCHER" ]; then
+  log "ERROR: $WATCHER missing or not executable — warmup did not complete." >&2
+  exit 1
+else
+  # nohup + & alone leaves the watcher attached to the controlling terminal,
+  # so use setsid (or `disown` fallback on systems without it) to reparent.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid nohup bash "$WATCHER" </dev/null >/dev/null 2>&1 &
+  else
+    nohup bash "$WATCHER" </dev/null >/dev/null 2>&1 &
+    disown
+  fi
+  log "upload watcher started (pid=$!, log: \$HOME/.qa-agent/watcher.log)"
+fi

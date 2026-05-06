@@ -12,6 +12,8 @@
 #   2. Register `bitrise-dev-environments` as an MCP server for Claude Code so
 #      the in-VM agent can drive screenshots / clicks / scrolls against this
 #      same session.
+#   3. Drop the upload watcher script ($HOME/.qa-agent/watcher.sh) onto disk;
+#      startup.sh forks it on every session start.
 #
 # Required template variables (exposed as env vars at script time):
 #   BITRISE_TOKEN          PAT for MCP server auth         (required)
@@ -110,4 +112,100 @@ else
     -- go run github.com/bitrise-io/bitrise-mcp-dev-environments@latest
 fi
 
-log "warmup complete (UDID=$UDID)"
+# ---------- Install the upload watcher script ------------------------------
+# startup.sh forks this on every session start. It blocks until a new file
+# appears under WATCH_DIR (the CLI's `--upload` lands here once the session
+# is RUNNING), then launches Claude in tmux with $QA_PROMPT.
+
+mkdir -p "$HOME/.qa-agent"
+cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
+#!/usr/bin/env bash
+# QA Agent upload watcher. Forked by startup.sh; runs detached for the
+# lifetime of the session. Inherits QA_PROMPT, BITRISE_*, and PATH from
+# the parent startup environment.
+set -u
+
+WATCH_DIR="${QA_WATCH_DIR:-/tmp}"
+TIMEOUT_SEC="${QA_WATCH_TIMEOUT_SEC:-1800}"   # 30 min default
+POLL_SEC="${QA_WATCH_POLL_SEC:-2}"
+LOG="$HOME/.qa-agent/watcher.log"
+BASELINE_FILE="$HOME/.qa-agent/baseline"
+
+mkdir -p "$HOME/.qa-agent"
+exec >>"$LOG" 2>&1
+
+ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
+say() { echo "[$(ts)] $*"; }
+
+list_dir() {
+  # Top-level regular files only, excluding dotfiles / our own state.
+  find "$WATCH_DIR" -maxdepth 1 -mindepth 1 -type f \! -name '.*' 2>/dev/null | sort
+}
+
+if [ -z "${QA_PROMPT:-}" ]; then
+  say "ERROR: QA_PROMPT not set — nothing to send to Claude. Exiting."
+  exit 1
+fi
+if ! command -v claude >/dev/null 2>&1; then
+  say "ERROR: claude CLI not on PATH."
+  exit 1
+fi
+if ! command -v tmux >/dev/null 2>&1; then
+  say "ERROR: tmux not on PATH (claudeAIWarmupSetup should have installed it)."
+  exit 1
+fi
+
+list_dir > "$BASELINE_FILE"
+BASE_COUNT=$(wc -l < "$BASELINE_FILE" | tr -d ' ')
+say "watcher pid=$$, watching $WATCH_DIR (baseline: $BASE_COUNT files), timeout=${TIMEOUT_SEC}s"
+
+DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+TARGET=""
+while true; do
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    say "ERROR: timed out waiting for upload after ${TIMEOUT_SEC}s"
+    exit 1
+  fi
+  TARGET="$(comm -13 "$BASELINE_FILE" <(list_dir) | head -n1)"
+  if [ -n "$TARGET" ]; then
+    say "candidate appeared: $TARGET"
+    break
+  fi
+  sleep "$POLL_SEC"
+done
+
+# Wait for size to stabilize — tar extraction on the server side writes the
+# file incrementally, so a too-eager Claude could read a half-extracted .ipa.
+PREV=-1
+while true; do
+  CURR="$(stat -f%z "$TARGET" 2>/dev/null || echo 0)"
+  if [ "$CURR" != "0" ] && [ "$CURR" = "$PREV" ]; then
+    break
+  fi
+  PREV="$CURR"
+  sleep 1
+done
+say "file stabilized at ${CURR} bytes: $TARGET"
+
+# Persist the resolved upload path so the prompt / Claude can refer to it
+# without re-doing the discovery dance.
+printf '%s\n' "$TARGET" > "$HOME/.qa-agent/upload-path"
+
+PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
+printf '%s' "$QA_PROMPT" > "$PROMPT_FILE"
+
+START_DIR="${SESSION_WORKING_DIR:-$HOME}"
+tmux new-session -d -s qa-agent -c "$START_DIR"
+tmux set -t qa-agent mouse on
+tmux send-keys -t qa-agent "claude \"\$(cat $PROMPT_FILE)\"" Enter
+say "claude launched in tmux session 'qa-agent' (prompt at $PROMPT_FILE)"
+
+# Mirror claudeAIAutoStart's behaviour: nudge the backend with WORKING so the
+# session UI doesn't sit on "idle" until the first hook event fires.
+if [ -x "$HOME/.claude/notify.sh" ]; then
+  echo '{}' | "$HOME/.claude/notify.sh" SESSION_NOTIFICATION_TYPE_AGENT_WORKING || true
+fi
+WATCHEREOF
+chmod +x "$HOME/.qa-agent/watcher.sh"
+
+log "warmup complete (UDID=$UDID); watcher installed at $HOME/.qa-agent/watcher.sh"
