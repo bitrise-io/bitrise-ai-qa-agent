@@ -45,7 +45,13 @@ if [ ! -s "$UDID_FILE" ]; then
 fi
 UDID="$(tr -d '[:space:]' < "$UDID_FILE")"
 
-# ---------- Boot the simulator (idempotent) --------------------------------
+# ---------- Kick off the simulator boot (non-blocking) ---------------------
+# We deliberately do NOT call `xcrun simctl bootstatus -b` here. That blocks
+# until the simulator is fully booted (springboard ready), which on a fresh
+# image cold-boot can take minutes — and until startup.sh returns, the
+# codespaces backend can't transition the session to RUNNING. The watcher
+# (forked below) waits for that full boot right before it launches Claude,
+# overlapping the boot wait with the upload wait.
 
 current_state() {
   xcrun simctl list devices -j | /usr/bin/python3 -c "
@@ -64,24 +70,20 @@ case "$state" in
   Booted)
     log "simulator $UDID already booted"
     ;;
-  Shutdown)
-    log "booting simulator $UDID"
-    xcrun simctl boot "$UDID"
-    xcrun simctl bootstatus "$UDID" -b
+  Booting)
+    log "simulator $UDID already booting — leaving it to finish in the background"
+    ;;
+  Shutdown | Shutting\ Down)
+    log "issuing async boot for simulator $UDID (state=$state)"
+    xcrun simctl boot "$UDID" 2>/dev/null || true
     ;;
   NotFound)
     log "ERROR: simulator $UDID not registered with simctl — was the device deleted?" >&2
     exit 1
     ;;
   *)
-    # Booting / Shutting Down — wait it out.
-    log "simulator in transient state '$state', waiting for it to settle"
-    xcrun simctl bootstatus "$UDID" -b || {
-      log "fallback: shutdown + reboot"
-      xcrun simctl shutdown "$UDID" 2>/dev/null || true
-      xcrun simctl boot "$UDID"
-      xcrun simctl bootstatus "$UDID" -b
-    }
+    log "simulator in unexpected state '$state', issuing boot anyway"
+    xcrun simctl boot "$UDID" 2>/dev/null || true
     ;;
 esac
 

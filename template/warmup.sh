@@ -197,6 +197,23 @@ while true; do
 done
 say "upload stabilized at ${CURR} bytes total across $(dir_file_count) file(s)"
 
+# Phase 3: ensure the simulator is fully booted before Claude tries to
+# install / launch the app. startup.sh kicked off the boot asynchronously
+# so the session could reach RUNNING quickly; we pay the wait here, where
+# it overlaps with whatever Claude is about to do anyway.
+SIM_UDID_FILE="$HOME/.qa-agent-simulator-udid"
+if [ -s "$SIM_UDID_FILE" ]; then
+  SIM_UDID="$(tr -d '[:space:]' < "$SIM_UDID_FILE")"
+  say "waiting for simulator $SIM_UDID to finish booting"
+  if ! xcrun simctl bootstatus "$SIM_UDID" -b; then
+    say "WARN: bootstatus failed; attempting one shutdown + reboot"
+    xcrun simctl shutdown "$SIM_UDID" 2>/dev/null || true
+    xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
+    xcrun simctl bootstatus "$SIM_UDID" -b || say "WARN: simulator still not ready; Claude will see this if it tries to install"
+  fi
+  say "simulator $SIM_UDID booted"
+fi
+
 # Persist the resolved upload directory so the prompt / Claude can refer to
 # it without re-doing the discovery dance.
 printf '%s\n' "$WATCH_DIR" > "$HOME/.qa-agent/upload-path"
