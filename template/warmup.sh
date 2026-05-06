@@ -113,9 +113,12 @@ else
 fi
 
 # ---------- Install the upload watcher script ------------------------------
-# startup.sh forks this on every session start. It blocks until a new file
-# appears under WATCH_DIR (the CLI's `--upload` lands here once the session
-# is RUNNING), then launches Claude in tmux with $QA_PROMPT.
+# startup.sh forks this on every session start. It blocks until the CLI's
+# `--upload` lands inside QA_WATCH_DIR (default /tmp/bitrise-ai-qa-agent),
+# then launches Claude in tmux with $QA_PROMPT. Watching a dedicated
+# subdirectory (rather than /tmp at large) means we don't have to filter
+# noise from system temp files or the codespaces backend's own /tmp/.claude_*
+# state — the directory itself is the signal.
 
 mkdir -p "$HOME/.qa-agent"
 cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
@@ -125,11 +128,10 @@ cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
 # the parent startup environment.
 set -u
 
-WATCH_DIR="${QA_WATCH_DIR:-/tmp}"
+WATCH_DIR="${QA_WATCH_DIR:-/tmp/bitrise-ai-qa-agent}"
 TIMEOUT_SEC="${QA_WATCH_TIMEOUT_SEC:-1800}"   # 30 min default
 POLL_SEC="${QA_WATCH_POLL_SEC:-2}"
 LOG="$HOME/.qa-agent/watcher.log"
-BASELINE_FILE="$HOME/.qa-agent/baseline"
 
 mkdir -p "$HOME/.qa-agent"
 exec >>"$LOG" 2>&1
@@ -137,9 +139,19 @@ exec >>"$LOG" 2>&1
 ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
 say() { echo "[$(ts)] $*"; }
 
-list_dir() {
-  # Top-level regular files only, excluding dotfiles / our own state.
-  find "$WATCH_DIR" -maxdepth 1 -mindepth 1 -type f \! -name '.*' 2>/dev/null | sort
+# Recursive total size of all regular files under WATCH_DIR. Returns 0 if
+# the directory does not exist yet. Sum rather than count because the CLI's
+# tar extraction grows files in place — a stable size means extraction is
+# done.
+dir_size() {
+  if [ ! -d "$WATCH_DIR" ]; then echo 0; return; fi
+  find "$WATCH_DIR" -type f -exec stat -f%z {} + 2>/dev/null \
+    | awk 'BEGIN{s=0} {s+=$1} END{print s}'
+}
+
+dir_file_count() {
+  if [ ! -d "$WATCH_DIR" ]; then echo 0; return; fi
+  find "$WATCH_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
 if [ -z "${QA_PROMPT:-}" ]; then
@@ -155,41 +167,39 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-list_dir > "$BASELINE_FILE"
-BASE_COUNT=$(wc -l < "$BASELINE_FILE" | tr -d ' ')
-say "watcher pid=$$, watching $WATCH_DIR (baseline: $BASE_COUNT files), timeout=${TIMEOUT_SEC}s"
+say "watcher pid=$$, watching $WATCH_DIR, timeout=${TIMEOUT_SEC}s"
 
+# Phase 1: wait for the directory to exist and contain at least one file.
 DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
-TARGET=""
 while true; do
   if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-    say "ERROR: timed out waiting for upload after ${TIMEOUT_SEC}s"
+    say "ERROR: timed out waiting for $WATCH_DIR after ${TIMEOUT_SEC}s"
     exit 1
   fi
-  TARGET="$(comm -13 "$BASELINE_FILE" <(list_dir) | head -n1)"
-  if [ -n "$TARGET" ]; then
-    say "candidate appeared: $TARGET"
+  if [ -d "$WATCH_DIR" ] && [ "$(dir_file_count)" -gt 0 ]; then
+    say "$WATCH_DIR appeared with $(dir_file_count) file(s)"
     break
   fi
   sleep "$POLL_SEC"
 done
 
-# Wait for size to stabilize — tar extraction on the server side writes the
-# file incrementally, so a too-eager Claude could read a half-extracted .ipa.
+# Phase 2: wait for total size to stabilize — tar extraction on the server
+# side writes incrementally, so a too-eager Claude could read a
+# half-extracted .ipa. Require two consecutive identical readings.
 PREV=-1
 while true; do
-  CURR="$(stat -f%z "$TARGET" 2>/dev/null || echo 0)"
+  CURR="$(dir_size)"
   if [ "$CURR" != "0" ] && [ "$CURR" = "$PREV" ]; then
     break
   fi
   PREV="$CURR"
   sleep 1
 done
-say "file stabilized at ${CURR} bytes: $TARGET"
+say "upload stabilized at ${CURR} bytes total across $(dir_file_count) file(s)"
 
-# Persist the resolved upload path so the prompt / Claude can refer to it
-# without re-doing the discovery dance.
-printf '%s\n' "$TARGET" > "$HOME/.qa-agent/upload-path"
+# Persist the resolved upload directory so the prompt / Claude can refer to
+# it without re-doing the discovery dance.
+printf '%s\n' "$WATCH_DIR" > "$HOME/.qa-agent/upload-path"
 
 PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
 printf '%s' "$QA_PROMPT" > "$PROMPT_FILE"

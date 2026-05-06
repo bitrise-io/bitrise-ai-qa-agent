@@ -28,15 +28,19 @@ template/
 3. **Startup** (every boot, including the first): `startup.sh` boots the
    simulator, publishes `/tmp/.qa-agent-info.json` with `{udid, session_id,
    workspace_id}`, and forks the watcher (`setsid nohup bash …`).
-4. **Session reaches RUNNING**, CLI uploads the iOS binary to
-   `/tmp/<basename>` via the codespaces signed-URL flow.
-5. **Watcher** detects the new file under `/tmp`, waits for its size to
-   stabilize, then launches Claude in a `qa-agent` tmux session as
+4. **Session reaches RUNNING**, CLI uploads the iOS binary into
+   `QA_WATCH_DIR` (default `/tmp/bitrise-ai-qa-agent/`) via the codespaces
+   signed-URL flow. The directory itself is the trigger — the CLI must pass
+   `--upload-destination /tmp/bitrise-ai-qa-agent`.
+5. **Watcher** detects `QA_WATCH_DIR` exists and is non-empty, waits for
+   the total recursive size to stabilize across two reads, then launches
+   Claude in a `qa-agent` tmux session as
    `claude -p --dangerously-skip-permissions "<QA_PROMPT>"`.
-6. **Claude** reads `/tmp/.qa-agent-info.json` and `~/.qa-agent/upload-path`,
-   installs the app on the simulator (`xcrun simctl install`), launches it,
-   and drives the UI via the MCP tools until the prompt is satisfied. Output
-   streams into `~/.qa-agent/claude.log`; the run is observable live via
+6. **Claude** reads `/tmp/.qa-agent-info.json` and `~/.qa-agent/upload-path`
+   (the directory path), picks the app inside it, installs it on the
+   simulator (`xcrun simctl install`), launches it, and drives the UI via
+   the MCP tools until the prompt is satisfied. Output streams into
+   `~/.qa-agent/claude.log`; the run is observable live via
    `tmux attach -t qa-agent`.
 
 This avoids the codespaces backend's `claudeAIAutoStart` path (which would
@@ -85,7 +89,7 @@ sees them.
 | `QA_PROMPT` | yes | — | Prompt sent to `claude -p`. Should reference `~/.qa-agent/upload-path` (the resolved app path) and `/tmp/.qa-agent-info.json` (`{udid, session_id, workspace_id}`). |
 | `DEVICE_TYPE` | no | `iPhone 15` | `xcrun simctl create` device type |
 | `IOS_VERSION` | no | highest available | iOS runtime version, e.g. `17.5` |
-| `QA_WATCH_DIR` | no | `/tmp` | Directory the watcher polls for the upload |
+| `QA_WATCH_DIR` | no | `/tmp/bitrise-ai-qa-agent` | Directory the watcher waits for the CLI to upload into. Must match the CLI's `--upload-destination`. |
 | `QA_WATCH_TIMEOUT_SEC` | no | `1800` | Seconds to wait for the upload before the watcher exits 1 |
 | `QA_WATCH_POLL_SEC` | no | `2` | Watcher poll interval |
 
@@ -99,8 +103,10 @@ the user references on session create.
 
 ### Things the CLI must (not) do
 
-- ✅ Pass `--upload <local-app>` so the binary lands at
-  `/tmp/<basename(local-app)>`.
+- ✅ Pass `--upload <local-app> --upload-destination /tmp/bitrise-ai-qa-agent`.
+  The watcher's trigger is the destination directory becoming non-empty and
+  size-stable; the default destination of `/tmp` does not work because that
+  directory is shared with system temp files and codespaces backend state.
 - ✅ Pass `--input QA_PROMPT="…"`. The prompt may reference
   `{{REMOTE_PATH}}`; the CLI substitutes that with the resolved upload path
   before submission.
@@ -115,8 +121,7 @@ the user references on session create.
 |---|---|---|---|
 | `~/.qa-agent-simulator-udid` | session user | warmup | UDID of the QA simulator device (single line) |
 | `~/.qa-agent/watcher.sh` | session user | warmup | Background upload watcher script |
-| `~/.qa-agent/baseline` | session user | watcher | Snapshot of `QA_WATCH_DIR` at watcher start |
-| `~/.qa-agent/upload-path` | session user | watcher | Absolute path of the detected upload, for the prompt to `cat` |
+| `~/.qa-agent/upload-path` | session user | watcher | Absolute path of the resolved upload directory (= `QA_WATCH_DIR`), for the prompt to `cat` |
 | `~/.qa-agent/watcher.log` | session user | watcher | Watcher run log |
 | `~/.qa-agent/claude.log` | session user | tmux pipe-pane | Live capture of the Claude run's stdout |
 | `/tmp/.qa-agent-info.json` | session user | startup | `{udid, session_id, workspace_id}` for the prompt |
