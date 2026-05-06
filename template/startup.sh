@@ -7,8 +7,8 @@
 #
 # Performed work:
 #   1. Boot the simulator created by warmup.sh.
-#   2. Publish a known-path manifest with { udid, session_id, workspace_id }
-#      so MCP tools and the prompt can target *this* session.
+#   2. Publish a known-path manifest with { udid, session_id } so MCP tools
+#      and the prompt can target *this* session.
 #   3. Fork the upload watcher (installed by warmup.sh): it blocks until the
 #      CLI's `--upload` lands in /tmp, then launches Claude in tmux with
 #      $QA_PROMPT. We do NOT use the codespaces backend's claudeAIAutoStart
@@ -21,10 +21,10 @@
 # The QA_PROMPT should look something like:
 #
 #   You are a QA tester. The app is at $(cat ~/.qa-agent/upload-path).
-#   Read /tmp/.qa-agent-info.json for { udid, session_id, workspace_id }.
+#   Read /tmp/.qa-agent-info.json for { udid, session_id }.
 #   Install: xcrun simctl install <udid> <upload-path>
-#   Launch the app, then drive it with the bitrise-dev-environments MCP
-#   tools (screenshot, click, scroll) against session_id to verify <task>.
+#   Launch the app, then drive it with the qa-agent MCP tools
+#   (qa_screenshot, qa_click, qa_scroll) to verify <task>.
 #   Report results, then exit.
 
 set -euo pipefail
@@ -124,13 +124,12 @@ if [ -z "$SESSION_ID" ]; then
 fi
 
 umask 077
-/usr/bin/python3 - "$UDID" "$SESSION_ID" "${BITRISE_WORKSPACE_ID:-}" > "$INFO_FILE" <<'PY'
+/usr/bin/python3 - "$UDID" "$SESSION_ID" > "$INFO_FILE" <<'PY'
 import json, sys
-udid, session_id, workspace_id = sys.argv[1], sys.argv[2], sys.argv[3]
+udid, session_id = sys.argv[1], sys.argv[2]
 print(json.dumps({
     "udid": udid,
     "session_id": session_id,
-    "workspace_id": workspace_id,
 }, indent=2))
 PY
 

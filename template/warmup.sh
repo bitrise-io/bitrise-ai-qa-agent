@@ -9,15 +9,12 @@
 # Performed work:
 #   1. Pre-create the iOS simulator device the QA run will use. Booting is
 #      left to startup.sh so the simulator is fresh each session.
-#   2. Register `bitrise-dev-environments` as an MCP server for Claude Code so
-#      the in-VM agent can drive screenshots / clicks / scrolls against this
-#      same session.
+#   2. Register `qa-agent` as an MCP server for Claude Code. It runs in-VM
+#      via `ai-qa-agent-cli mcp` and exposes qa_screenshot / qa_click /
+#      qa_type / qa_scroll / qa_mouse_drag tools that drive the local macOS
+#      display directly — no Codespaces-backend round-trip, no PAT.
 #   3. Drop the upload watcher script ($HOME/.qa-agent/watcher.sh) onto disk;
 #      startup.sh forks it on every session start.
-#
-# Required template variables (exposed as env vars at script time):
-#   BITRISE_TOKEN          PAT for MCP server auth         (required)
-#   BITRISE_WORKSPACE_ID   Workspace slug for MCP server   (required)
 #
 # Optional session inputs (sane defaults applied):
 #   XCODE_VERSION e.g. "26.3"       (default: 26.3) — selects /Applications/Xcode-<version>.app via DEVELOPER_DIR
@@ -133,30 +130,43 @@ else
   echo '{"skipDangerousModePermissionPrompt": true}' | jq . > "$CLAUDE_SETTINGS"
 fi
 
-# ---------- Register bitrise-dev-environments MCP server -------------------
+# ---------- Register qa-agent MCP server -----------------------------------
 # claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
 # script, so `claude` resolves. `claude mcp add --scope user` merges the
 # server entry into ~/.claude.json without disturbing the existing trust /
 # onboarding fields written by claudeAISetup.
+#
+# `ai-qa-agent-cli mcp` runs in-VM and posts CGEvents / invokes
+# `screencapture` locally. TCC matches grants against the *responsible*
+# process in the attribution chain, and this MCP is launched as a
+# descendant of guest-agent (guest-agent → warmup/startup → watcher →
+# tmux → claude → mcp), so the kTCCService{Accessibility,PostEvent,ScreenCapture}
+# grants tccSetup installs against guest-agent at session warmup cover us.
+# See bitrise-codespaces/backend/CLAUDE.md "macOS session VMs — TCC permissions".
+#
+# We also drop any prior `bitrise-dev-environments` registration on the
+# user scope. That MCP is still the right choice for non-QA-Agent dev
+# environments, but this template no longer uses it (the in-VM server here
+# replaces the round-trip through the public Codespaces backend), so a
+# stale entry left over from an older warmup would just clutter the tool
+# list shown to Claude.
 
 if ! command -v claude >/dev/null 2>&1; then
   log "ERROR: claude CLI not on PATH — Claude credentials must be configured" >&2
   log "       on the session (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)." >&2
   exit 1
-elif [ -z "${BITRISE_TOKEN:-}" ] || [ -z "${BITRISE_WORKSPACE_ID:-}" ]; then
-  log "ERROR: BITRISE_TOKEN / BITRISE_WORKSPACE_ID not set as template variables." >&2
-  log "       The in-VM agent cannot drive the session without them." >&2
-  exit 1
 elif ! command -v go >/dev/null 2>&1; then
   log "ERROR: go not on PATH — image is missing Go ≥ 1.25, required to run the MCP server." >&2
   exit 1
+elif ! command -v swiftc >/dev/null 2>&1; then
+  log "ERROR: swiftc not on PATH — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
+  exit 1
 else
-  log "registering bitrise-dev-environments MCP server (user scope)"
+  log "registering qa-agent MCP server (user scope)"
   claude mcp remove --scope user bitrise-dev-environments >/dev/null 2>&1 || true
-  claude mcp add --scope user bitrise-dev-environments \
-    -e "BITRISE_TOKEN=${BITRISE_TOKEN}" \
-    -e "BITRISE_WORKSPACE_ID=${BITRISE_WORKSPACE_ID}" \
-    -- go run github.com/bitrise-io/bitrise-mcp-dev-environments@latest
+  claude mcp remove --scope user qa-agent >/dev/null 2>&1 || true
+  claude mcp add --scope user qa-agent \
+    -- go run github.com/bitrise-io/ai-qa-agent-cli@latest mcp
 fi
 
 # ---------- Install the upload watcher script ------------------------------
