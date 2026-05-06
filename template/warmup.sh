@@ -108,24 +108,20 @@ PY
   log "using runtime (highest available): $RUNTIME_ID"
 fi
 
-# ---------- Create or reuse the simulator device ---------------------------
+# ---------- Create the simulator device ------------------------------------
+# Warmup runs once per VM — there's no prior `bitrise-qa-agent` simulator to
+# reuse on this VM's persistent disk, so we skip the existence check and
+# `simctl create` straight away. This collapses two simctl calls into one,
+# which matters because the FIRST simctl invocation under a freshly-set
+# DEVELOPER_DIR pays for CoreSimulator's first-launch (license accept,
+# runtime catalog load). On a beta or non-default Xcode that's minutes;
+# on a pre-warmed system-default Xcode it's seconds. Doing only `create`
+# means the wait is paid by the operation we actually want, not a discovery
+# call that we then throw away.
 
-EXISTING_UDID="$(xcrun simctl list devices -j | /usr/bin/python3 -c "
-import json, sys
-name = '$SIM_NAME'
-for devs in json.load(sys.stdin)['devices'].values():
-    for d in devs:
-        if d['name'] == name and d.get('isAvailable', True):
-            print(d['udid']); break
-")"
-
-if [ -n "$EXISTING_UDID" ]; then
-  UDID="$EXISTING_UDID"
-  log "reusing simulator $SIM_NAME ($UDID)"
-else
-  log "creating simulator $SIM_NAME ($DEVICE_TYPE / $RUNTIME_ID)"
-  UDID="$(xcrun simctl create "$SIM_NAME" "$DEVICE_TYPE" "$RUNTIME_ID")"
-fi
+log "creating simulator $SIM_NAME ($DEVICE_TYPE / $RUNTIME_ID) — first xcrun call under DEVELOPER_DIR=$DEVELOPER_DIR, may stall on CoreSimulator first-launch on a non-default Xcode"
+UDID="$(xcrun simctl create "$SIM_NAME" "$DEVICE_TYPE" "$RUNTIME_ID")"
+log "created simulator: $UDID"
 
 printf '%s\n' "$UDID" > "$UDID_FILE"
 
