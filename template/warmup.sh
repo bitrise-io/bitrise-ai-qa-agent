@@ -297,15 +297,29 @@ chmod +x "$HOME/.qa-agent/wait-for-deps.sh"
 cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
 #!/usr/bin/env bash
 # QA Agent launcher. Forked by startup.sh; runs detached for the session
-# lifetime. Inherits QA_PROMPT, BITRISE_*, DEVELOPER_DIR, and PATH from the
+# lifetime. Inherits AI_PROMPT, BITRISE_*, DEVELOPER_DIR, and PATH from the
 # parent startup environment.
 #
-# Single responsibility: spawn Claude in tmux ASAP. The dependency waits
-# (simctl create, upload arrival, simctl bootstatus, info.json write) are
-# done by ~/.qa-agent/wait-for-deps.sh, which Claude calls as its first
-# Bash tool action. Doing it that way keeps the tmux session attachable
-# from the moment startup returns, which the codespaces UI's "open Claude
-# session" probe depends on.
+# Two-pass coexistence with the codespaces backend's claudeAIAutoStart:
+# the backend creates a `claude-auto` tmux session at the end of warmup
+# whenever AI_PROMPT is non-empty (running plain `claude $AI_PROMPT`). We
+# need:
+#   1. The same tmux session NAME so the codespaces UI's auto-attach probe
+#      (TerminalCard.tsx, gated on session.aiPrompt) renames it to
+#      claude-{tabId} on first attach and the "open Claude session" button
+#      finds it on subsequent visits.
+#   2. The session to run `claude --dangerously-skip-permissions` (yolo)
+#      because there's no human to approve tool prompts. claudeAIAutoStart
+#      doesn't pass that flag and we can't change it from outside.
+# Solution: kill any existing claude-auto and recreate it with the yolo flag.
+# Brief overlap (claudeAIAutoStart's plain claude runs for ~1s before we
+# kill it) is harmless — claude takes longer than that to even reach a tool
+# call.
+#
+# The dependency waits (simctl create, upload arrival, simctl bootstatus,
+# info.json write) are done by ~/.qa-agent/wait-for-deps.sh, which Claude
+# calls as its first Bash tool action. That keeps the tmux session
+# attachable from the moment startup returns.
 set -u
 
 mkdir -p "$HOME/.qa-agent"
@@ -315,8 +329,8 @@ exec >>"$LOG" 2>&1
 ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
 say() { echo "[$(ts)] $*"; }
 
-if [ -z "${QA_PROMPT:-}" ]; then
-  say "ERROR: QA_PROMPT not set — nothing to send to Claude. Exiting."
+if [ -z "${AI_PROMPT:-}" ]; then
+  say "ERROR: AI_PROMPT not set — nothing to send to Claude. Did the CLI forget to set ai_prompt? Exiting."
   exit 1
 fi
 if ! command -v claude >/dev/null 2>&1; then
@@ -329,20 +343,18 @@ if ! command -v tmux >/dev/null 2>&1; then
 fi
 
 PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
-printf '%s' "$QA_PROMPT" > "$PROMPT_FILE"
+printf '%s' "$AI_PROMPT" > "$PROMPT_FILE"
 
 START_DIR="${SESSION_WORKING_DIR:-$HOME}"
-# Interactive yolo: --dangerously-skip-permissions auto-approves every tool
-# call so the run never blocks on a permission prompt (no human is attached
-# to approve them). We deliberately drop -p / --print so the agent leaves
-# its conversation rendered in the tmux pane — the codespaces UI's "open
-# Claude session" probe (TerminalCard.tsx) looks for a tmux session named
-# `claude-auto`, renames it to `claude-{tabId}` on first attach, and
-# probes for that name on every reload. Match the convention so the UI's
-# attach-existing-session path works for our run.
-# pipe-pane still mirrors the rendered pane to ~/.qa-agent/claude.log for
-# offline inspection.
 TMUX_SESSION="claude-auto"
+
+# Drop any existing claude-auto (likely created by claudeAIAutoStart with
+# plain `claude`, no yolo). Recreate with the yolo flag below.
+if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+  say "found existing $TMUX_SESSION (likely from claudeAIAutoStart) — killing it to replace with yolo-mode claude"
+  tmux kill-session -t "$TMUX_SESSION" 2>/dev/null || true
+fi
+
 tmux new-session -d -s "$TMUX_SESSION" -c "$START_DIR"
 tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $HOME/.qa-agent/claude.log"
 tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
