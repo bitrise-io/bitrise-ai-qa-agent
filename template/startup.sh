@@ -31,6 +31,7 @@ set -euo pipefail
 
 log() { echo "[qa-agent startup] $*"; }
 
+XCODE_VERSION="${XCODE_VERSION:-26.3}"
 UDID_FILE="$HOME/.qa-agent-simulator-udid"
 INFO_FILE="/tmp/.qa-agent-info.json"
 
@@ -38,6 +39,23 @@ if [ "$(uname)" != "Darwin" ]; then
   log "ERROR: QA Agent template only supports macOS sessions." >&2
   exit 1
 fi
+
+# Match warmup.sh: pick the same Xcode for every simctl call so the version
+# the simulator was created against is the version we boot it with.
+XCODE_PATH=""
+for _candidate in \
+  "/Applications/Xcode-${XCODE_VERSION}.app" \
+  "/Applications/Xcode_${XCODE_VERSION}.app"; do
+  if [ -d "$_candidate" ]; then
+    XCODE_PATH="$_candidate"; break
+  fi
+done
+if [ -z "$XCODE_PATH" ]; then
+  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app" >&2
+  exit 1
+fi
+export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
+log "using Xcode ${XCODE_VERSION} at $XCODE_PATH"
 
 if [ ! -s "$UDID_FILE" ]; then
   log "ERROR: $UDID_FILE missing — warmup.sh did not run successfully." >&2

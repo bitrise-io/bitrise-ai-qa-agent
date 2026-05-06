@@ -20,6 +20,7 @@
 #   BITRISE_WORKSPACE_ID   Workspace slug for MCP server   (required)
 #
 # Optional session inputs (sane defaults applied):
+#   XCODE_VERSION e.g. "26.3"       (default: 26.3) — selects /Applications/Xcode-<version>.app via DEVELOPER_DIR
 #   DEVICE_TYPE   e.g. "iPhone 15"  (default: iPhone 15)
 #   IOS_VERSION   e.g. "17.5"       (default: highest available iOS runtime)
 
@@ -27,6 +28,7 @@ set -euo pipefail
 
 log() { echo "[qa-agent warmup] $*"; }
 
+XCODE_VERSION="${XCODE_VERSION:-26.3}"
 DEVICE_TYPE="${DEVICE_TYPE:-iPhone 15}"
 IOS_VERSION="${IOS_VERSION:-}"
 SIM_NAME="bitrise-qa-agent"
@@ -44,8 +46,28 @@ fi
 # to download.
 mkdir -p "$HOME/.qa-agent/results"
 
+# ---------- Select Xcode via DEVELOPER_DIR --------------------------------
+# Bitrise images ship multiple Xcodes side-by-side under /Applications. We
+# prefer DEVELOPER_DIR over `sudo xcode-select -s` so the choice is
+# per-process (no sudo, no global state) and survives session restarts.
+XCODE_PATH=""
+for _candidate in \
+  "/Applications/Xcode-${XCODE_VERSION}.app" \
+  "/Applications/Xcode_${XCODE_VERSION}.app"; do
+  if [ -d "$_candidate" ]; then
+    XCODE_PATH="$_candidate"; break
+  fi
+done
+if [ -z "$XCODE_PATH" ]; then
+  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app" >&2
+  log "       installed: $(ls -d /Applications/Xcode*.app 2>/dev/null | xargs -n1 basename | tr '\n' ' ')" >&2
+  exit 1
+fi
+export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
+log "using Xcode ${XCODE_VERSION} at $XCODE_PATH"
+
 if ! xcrun simctl help >/dev/null 2>&1; then
-  log "ERROR: xcrun simctl unavailable — image is missing Xcode." >&2
+  log "ERROR: xcrun simctl unavailable — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
   exit 1
 fi
 
