@@ -185,40 +185,135 @@ fi
 # startup.sh fails fast with "watcher missing" otherwise, which masks the
 # real warmup-stage failure.
 
-log "installing upload watcher script"
+log "installing wait-for-deps and launcher scripts"
 mkdir -p "$HOME/.qa-agent"
-cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
+
+# wait-for-deps.sh — Claude calls this as its first action. It blocks until
+# the simulator is created + booted and the app upload has stabilised, then
+# writes /tmp/.qa-agent-info.json with the resolved udid + session_id.
+# Idempotent: running it twice is harmless once everything is ready.
+cat > "$HOME/.qa-agent/wait-for-deps.sh" <<'DEPSEOF'
 #!/usr/bin/env bash
-# QA Agent upload watcher. Forked by startup.sh; runs detached for the
-# lifetime of the session. Inherits QA_PROMPT, BITRISE_*, and PATH from
-# the parent startup environment.
 set -u
+mkdir -p "$HOME/.qa-agent"
+LOG="$HOME/.qa-agent/wait-for-deps.log"
+exec > >(tee -a "$LOG") 2>&1
+
+ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
+say() { echo "[$(ts)] [wait-for-deps] $*"; }
 
 WATCH_DIR="${QA_WATCH_DIR:-/tmp/bitrise-ai-qa-agent}"
-TIMEOUT_SEC="${QA_WATCH_TIMEOUT_SEC:-1800}"   # 30 min default
+TIMEOUT_SEC="${QA_WATCH_TIMEOUT_SEC:-1800}"
 POLL_SEC="${QA_WATCH_POLL_SEC:-2}"
-LOG="$HOME/.qa-agent/watcher.log"
+
+SIM_UDID_FILE="$HOME/.qa-agent-simulator-udid"
+SIM_CREATE_EXIT="$HOME/.qa-agent/sim-create.exit"
+
+# Phase 0: wait for the background simctl create kicked off by warmup.sh.
+DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+say "waiting for background simctl create"
+while true; do
+  if [ -s "$SIM_CREATE_EXIT" ]; then
+    SIM_RC="$(tr -d '[:space:]' < "$SIM_CREATE_EXIT")"
+    if [ "$SIM_RC" = "0" ] && [ -s "$SIM_UDID_FILE" ]; then
+      break
+    fi
+    say "ERROR: background simctl create failed (rc=$SIM_RC). See $HOME/.qa-agent/sim-create.log"
+    exit 1
+  fi
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    say "ERROR: timed out waiting for sim-create after ${TIMEOUT_SEC}s; tail of sim-create.log:"
+    tail -n 20 "$HOME/.qa-agent/sim-create.log" 2>/dev/null || true
+    exit 1
+  fi
+  sleep "$POLL_SEC"
+done
+SIM_UDID="$(tr -d '[:space:]' < "$SIM_UDID_FILE")"
+say "simulator created: $SIM_UDID"
+
+# Kick the boot off NOW (non-blocking) so it warms while we wait for the upload.
+xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
+
+# Phase 1: wait for the upload directory to exist and contain at least one file.
+DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+say "waiting for upload at $WATCH_DIR"
+while true; do
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    say "ERROR: timed out waiting for $WATCH_DIR after ${TIMEOUT_SEC}s"
+    exit 1
+  fi
+  if [ -d "$WATCH_DIR" ] && [ "$(find "$WATCH_DIR" -type f 2>/dev/null | wc -l | tr -d ' ')" -gt 0 ]; then
+    say "$WATCH_DIR appeared with $(find "$WATCH_DIR" -type f 2>/dev/null | wc -l | tr -d ' ') file(s)"
+    break
+  fi
+  sleep "$POLL_SEC"
+done
+
+# Phase 2: wait for the recursive total size to stabilise across two reads.
+PREV=-1
+while true; do
+  CURR="$(find "$WATCH_DIR" -type f -exec stat -f%z {} + 2>/dev/null | awk 'BEGIN{s=0} {s+=$1} END{print s}')"
+  if [ "$CURR" != "0" ] && [ "$CURR" = "$PREV" ]; then
+    break
+  fi
+  PREV="$CURR"
+  sleep 1
+done
+say "upload stabilized at ${CURR} bytes"
+printf '%s\n' "$WATCH_DIR" > "$HOME/.qa-agent/upload-path"
+
+# Phase 3: simulator must be fully booted before the install attempt.
+say "waiting for simulator $SIM_UDID to finish booting"
+if ! xcrun simctl bootstatus "$SIM_UDID" -b; then
+  say "WARN: bootstatus failed; attempting one shutdown + reboot"
+  xcrun simctl shutdown "$SIM_UDID" 2>/dev/null || true
+  xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
+  xcrun simctl bootstatus "$SIM_UDID" -b || say "WARN: simulator still not ready"
+fi
+say "simulator $SIM_UDID booted"
+
+# Phase 4: publish the manifest. session_id comes from the backend-injected
+# webhook URL — see bitrise-codespaces session_start.go.
+SESSION_ID=""
+if [ -n "${CODESPACES_NOTIFICATIONS_URL:-}" ]; then
+  SESSION_ID="$(printf '%s' "$CODESPACES_NOTIFICATIONS_URL" \
+    | sed -n 's|.*/sessions/\([^/]*\)/notifications.*|\1|p')"
+fi
+INFO_FILE="/tmp/.qa-agent-info.json"
+umask 077
+/usr/bin/python3 - "$SIM_UDID" "$SESSION_ID" > "$INFO_FILE" <<'PY'
+import json, sys
+udid, session_id = sys.argv[1], sys.argv[2]
+print(json.dumps({"udid": udid, "session_id": session_id}, indent=2))
+PY
+say "ready: udid=$SIM_UDID session_id=$SESSION_ID upload=$WATCH_DIR (manifest at $INFO_FILE)"
+DEPSEOF
+chmod +x "$HOME/.qa-agent/wait-for-deps.sh"
+
+# launcher (still named watcher.sh for backwards-compat with startup.sh) —
+# spawns tmux + claude immediately so the codespaces UI's attach probe sees
+# the session right away. The dependency waits happen later, as Claude's
+# first Bash tool call into wait-for-deps.sh.
+cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
+#!/usr/bin/env bash
+# QA Agent launcher. Forked by startup.sh; runs detached for the session
+# lifetime. Inherits QA_PROMPT, BITRISE_*, DEVELOPER_DIR, and PATH from the
+# parent startup environment.
+#
+# Single responsibility: spawn Claude in tmux ASAP. The dependency waits
+# (simctl create, upload arrival, simctl bootstatus, info.json write) are
+# done by ~/.qa-agent/wait-for-deps.sh, which Claude calls as its first
+# Bash tool action. Doing it that way keeps the tmux session attachable
+# from the moment startup returns, which the codespaces UI's "open Claude
+# session" probe depends on.
+set -u
 
 mkdir -p "$HOME/.qa-agent"
+LOG="$HOME/.qa-agent/launcher.log"
 exec >>"$LOG" 2>&1
 
 ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
 say() { echo "[$(ts)] $*"; }
-
-# Recursive total size of all regular files under WATCH_DIR. Returns 0 if
-# the directory does not exist yet. Sum rather than count because the CLI's
-# tar extraction grows files in place — a stable size means extraction is
-# done.
-dir_size() {
-  if [ ! -d "$WATCH_DIR" ]; then echo 0; return; fi
-  find "$WATCH_DIR" -type f -exec stat -f%z {} + 2>/dev/null \
-    | awk 'BEGIN{s=0} {s+=$1} END{print s}'
-}
-
-dir_file_count() {
-  if [ ! -d "$WATCH_DIR" ]; then echo 0; return; fi
-  find "$WATCH_DIR" -type f 2>/dev/null | wc -l | tr -d ' '
-}
 
 if [ -z "${QA_PROMPT:-}" ]; then
   say "ERROR: QA_PROMPT not set — nothing to send to Claude. Exiting."
@@ -232,101 +327,6 @@ if ! command -v tmux >/dev/null 2>&1; then
   say "ERROR: tmux not on PATH (claudeAIWarmupSetup should have installed it)."
   exit 1
 fi
-
-say "watcher pid=$$, watching $WATCH_DIR, timeout=${TIMEOUT_SEC}s"
-
-# Phase 0: wait for the background `simctl create` (kicked off by warmup) to
-# finish. The exit-code file is the rendezvous point. We do this BEFORE the
-# upload wait so a bad sim-create surfaces fast even on slow uploads.
-SIM_UDID_FILE="$HOME/.qa-agent-simulator-udid"
-SIM_CREATE_EXIT="$HOME/.qa-agent/sim-create.exit"
-DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
-say "waiting for background simctl create"
-while true; do
-  if [ -s "$SIM_CREATE_EXIT" ]; then
-    SIM_RC="$(tr -d '[:space:]' < "$SIM_CREATE_EXIT")"
-    if [ "$SIM_RC" = "0" ] && [ -s "$SIM_UDID_FILE" ]; then
-      break
-    fi
-    say "ERROR: background simctl create failed (rc=$SIM_RC). See $HOME/.qa-agent/sim-create.log"
-    exit 1
-  fi
-  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-    say "ERROR: timed out waiting for sim-create after ${TIMEOUT_SEC}s; tail of $HOME/.qa-agent/sim-create.log:"
-    tail -n 20 "$HOME/.qa-agent/sim-create.log" 2>/dev/null || true
-    exit 1
-  fi
-  sleep "$POLL_SEC"
-done
-SIM_UDID="$(tr -d '[:space:]' < "$SIM_UDID_FILE")"
-say "simulator created: $SIM_UDID"
-
-# Kick the simulator boot off NOW (non-blocking) so it warms while we wait
-# for the upload. We bootstatus -b later, after the upload arrives.
-xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
-
-# Phase 1: wait for the upload directory to exist and contain at least one file.
-DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
-while true; do
-  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
-    say "ERROR: timed out waiting for $WATCH_DIR after ${TIMEOUT_SEC}s"
-    exit 1
-  fi
-  if [ -d "$WATCH_DIR" ] && [ "$(dir_file_count)" -gt 0 ]; then
-    say "$WATCH_DIR appeared with $(dir_file_count) file(s)"
-    break
-  fi
-  sleep "$POLL_SEC"
-done
-
-# Phase 2: wait for total size to stabilize — tar extraction on the server
-# side writes incrementally, so a too-eager Claude could read a
-# half-extracted .ipa. Require two consecutive identical readings.
-PREV=-1
-while true; do
-  CURR="$(dir_size)"
-  if [ "$CURR" != "0" ] && [ "$CURR" = "$PREV" ]; then
-    break
-  fi
-  PREV="$CURR"
-  sleep 1
-done
-say "upload stabilized at ${CURR} bytes total across $(dir_file_count) file(s)"
-
-# Phase 3: simulator must be fully booted before Claude tries to install the app.
-say "waiting for simulator $SIM_UDID to finish booting"
-if ! xcrun simctl bootstatus "$SIM_UDID" -b; then
-  say "WARN: bootstatus failed; attempting one shutdown + reboot"
-  xcrun simctl shutdown "$SIM_UDID" 2>/dev/null || true
-  xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
-  xcrun simctl bootstatus "$SIM_UDID" -b || say "WARN: simulator still not ready; Claude will see this if it tries to install"
-fi
-say "simulator $SIM_UDID booted"
-
-# Phase 4: publish the manifest the prompt reads. session_id comes from
-# CODESPACES_NOTIFICATIONS_URL (the only backend-injected env var that
-# carries it). We move this into the watcher so startup.sh doesn't depend
-# on the simulator existing yet.
-INFO_FILE="/tmp/.qa-agent-info.json"
-SESSION_ID=""
-if [ -n "${CODESPACES_NOTIFICATIONS_URL:-}" ]; then
-  SESSION_ID="$(printf '%s' "$CODESPACES_NOTIFICATIONS_URL" \
-    | sed -n 's|.*/sessions/\([^/]*\)/notifications.*|\1|p')"
-fi
-if [ -z "$SESSION_ID" ]; then
-  say "WARN: could not derive session_id from CODESPACES_NOTIFICATIONS_URL; the prompt will need it passed explicitly."
-fi
-umask 077
-/usr/bin/python3 - "$SIM_UDID" "$SESSION_ID" > "$INFO_FILE" <<'PY'
-import json, sys
-udid, session_id = sys.argv[1], sys.argv[2]
-print(json.dumps({"udid": udid, "session_id": session_id}, indent=2))
-PY
-say "manifest at $INFO_FILE"
-
-# Persist the resolved upload directory so the prompt / Claude can refer to
-# it without re-doing the discovery dance.
-printf '%s\n' "$WATCH_DIR" > "$HOME/.qa-agent/upload-path"
 
 PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
 printf '%s' "$QA_PROMPT" > "$PROMPT_FILE"
@@ -355,7 +355,7 @@ if [ -x "$HOME/.claude/notify.sh" ]; then
 fi
 WATCHEREOF
 chmod +x "$HOME/.qa-agent/watcher.sh"
-log "watcher installed at $HOME/.qa-agent/watcher.sh"
+log "wait-for-deps and launcher installed in $HOME/.qa-agent/"
 
 # ---------- Register qa-agent MCP server -----------------------------------
 # claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
