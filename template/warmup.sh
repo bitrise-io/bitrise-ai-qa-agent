@@ -7,10 +7,9 @@
 # script_builder.go:579 for the full ordering.
 #
 # Performed work:
-#   1. Pre-create the iOS simulator device the QA run will use.
-#   2. Boot it once to warm caches (springboard, daemons, fonts), then shutdown.
-#      The matching startup script will boot it again per session start.
-#   3. Register `bitrise-dev-environments` as an MCP server for Claude Code so
+#   1. Pre-create the iOS simulator device the QA run will use. Booting is
+#      left to startup.sh so the simulator is fresh each session.
+#   2. Register `bitrise-dev-environments` as an MCP server for Claude Code so
 #      the in-VM agent can drive screenshots / clicks / scrolls against this
 #      same session.
 #
@@ -84,13 +83,6 @@ else
 fi
 
 printf '%s\n' "$UDID" > "$UDID_FILE"
-
-# ---------- Warm the simulator caches --------------------------------------
-
-log "warming simulator (boot → bootstatus → shutdown)"
-xcrun simctl boot "$UDID" 2>/dev/null || true
-xcrun simctl bootstatus "$UDID" -b
-xcrun simctl shutdown "$UDID" 2>/dev/null || true
 
 # ---------- Register bitrise-dev-environments MCP server -------------------
 # claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
