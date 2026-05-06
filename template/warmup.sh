@@ -86,6 +86,24 @@ fi
 
 printf '%s\n' "$UDID" > "$UDID_FILE"
 
+# ---------- Pre-accept Claude's bypass-permissions consent dialog ----------
+# `claude --dangerously-skip-permissions` shows a one-time interactive
+# consent dialog ("Yes, I accept") on first use in a given user-settings
+# tree. Setting skipDangerousModePermissionPrompt=true in
+# ~/.claude/settings.json suppresses it (Claude Code checks this key across
+# user/local/flag/policy settings — see GQ() in the claude binary).
+# The codespaces backend's claudeAIHooksSetup runs *after* this script and
+# only touches .hooks.* fields via jq, so this top-level key is preserved.
+
+mkdir -p "$HOME/.claude"
+CLAUDE_SETTINGS="$HOME/.claude/settings.json"
+if [ -f "$CLAUDE_SETTINGS" ] && jq empty "$CLAUDE_SETTINGS" 2>/dev/null; then
+  _TMP="$(mktemp)"
+  jq '. + {skipDangerousModePermissionPrompt: true}' "$CLAUDE_SETTINGS" > "$_TMP" && mv "$_TMP" "$CLAUDE_SETTINGS"
+else
+  echo '{"skipDangerousModePermissionPrompt": true}' | jq . > "$CLAUDE_SETTINGS"
+fi
+
 # ---------- Register bitrise-dev-environments MCP server -------------------
 # claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
 # script, so `claude` resolves. `claude mcp add --scope user` merges the
