@@ -63,33 +63,44 @@ fi
 export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
 log "using Xcode ${XCODE_VERSION} at $XCODE_PATH"
 
-if ! xcrun simctl help >/dev/null 2>&1; then
-  log "ERROR: xcrun simctl unavailable — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
-  exit 1
+# ---------- Resolve iOS runtime --------------------------------------------
+# `xcrun simctl` is slow on the FIRST invocation under a freshly-set
+# DEVELOPER_DIR — CoreSimulator runs first-launch (license, runtime index)
+# and it's not unusual for that to take 3–5 minutes on a beta Xcode that
+# hasn't been warmed on this image. We split the work and time-stamp each
+# phase so the cause of any future hang is obvious from the warmup log.
+
+# Fast path: when IOS_VERSION is given, construct the runtime identifier
+# directly. simctl create will validate it on use, so we skip the slow
+# `simctl list runtimes -j` entirely.
+RUNTIME_ID=""
+if [ -n "$IOS_VERSION" ]; then
+  _RT_MAJOR_MINOR="$(printf '%s' "$IOS_VERSION" | tr '.' '-' | cut -d'-' -f1,2)"
+  RUNTIME_ID="com.apple.CoreSimulator.SimRuntime.iOS-${_RT_MAJOR_MINOR}"
+  log "using runtime (constructed from IOS_VERSION=$IOS_VERSION): $RUNTIME_ID"
 fi
 
-# ---------- Resolve iOS runtime --------------------------------------------
-
-resolve_runtime() {
-  /usr/bin/python3 - "$IOS_VERSION" <<'PY'
+if [ -z "$RUNTIME_ID" ]; then
+  # Slow path: enumerate to pick the highest available runtime. The first
+  # `xcrun simctl ...` here pays the CoreSimulator first-launch cost.
+  log "first xcrun call under DEVELOPER_DIR=$DEVELOPER_DIR (CoreSimulator first-launch can take several minutes on a cold beta Xcode)"
+  if ! xcrun simctl help >/dev/null 2>&1; then
+    log "ERROR: xcrun simctl unavailable — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
+    exit 1
+  fi
+  log "enumerating simulator runtimes"
+  RUNTIME_ID="$(/usr/bin/python3 - <<'PY'
 import json, subprocess, sys
-want = sys.argv[1].strip().lower()
 data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "runtimes", "-j"]))
 ios = [r for r in data["runtimes"] if r.get("isAvailable") and "ios" in r["name"].lower()]
 if not ios:
     sys.exit("no available iOS runtimes")
-if want:
-    for r in ios:
-        if want in r["name"].lower():
-            print(r["identifier"]); sys.exit()
-    sys.exit(f"requested iOS {want} not available — image has: " + ", ".join(r["name"] for r in ios))
 ios.sort(key=lambda r: tuple(int(x) for x in r["version"].split(".")), reverse=True)
 print(ios[0]["identifier"])
 PY
-}
-
-RUNTIME_ID="$(resolve_runtime)"
-log "using runtime: $RUNTIME_ID"
+)"
+  log "using runtime (highest available): $RUNTIME_ID"
+fi
 
 # ---------- Create or reuse the simulator device ---------------------------
 
