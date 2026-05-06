@@ -37,6 +37,13 @@ if [ "$(uname)" != "Darwin" ]; then
   exit 1
 fi
 
+# Pre-create the results directory the prompt asks Claude to write into. Bitrise's
+# JUnit attachment convention requires the attachment files to sit next to junit.xml,
+# so we keep this layout flat (no screenshots/ subdir). The dir is created up front
+# even when Claude never runs, so `session collect` always has something non-empty
+# to download.
+mkdir -p "$HOME/.qa-agent/results"
+
 if ! xcrun simctl help >/dev/null 2>&1; then
   log "ERROR: xcrun simctl unavailable — image is missing Xcode." >&2
   exit 1
