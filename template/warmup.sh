@@ -335,14 +335,18 @@ START_DIR="${SESSION_WORKING_DIR:-$HOME}"
 # Interactive yolo: --dangerously-skip-permissions auto-approves every tool
 # call so the run never blocks on a permission prompt (no human is attached
 # to approve them). We deliberately drop -p / --print so the agent leaves
-# its conversation rendered in the tmux pane — `tmux attach -t qa-agent`
-# from SSH then shows the live transcript instead of an already-exited shell.
+# its conversation rendered in the tmux pane — the codespaces UI's "open
+# Claude session" probe (TerminalCard.tsx) looks for a tmux session named
+# `claude-auto`, renames it to `claude-{tabId}` on first attach, and
+# probes for that name on every reload. Match the convention so the UI's
+# attach-existing-session path works for our run.
 # pipe-pane still mirrors the rendered pane to ~/.qa-agent/claude.log for
 # offline inspection.
-tmux new-session -d -s qa-agent -c "$START_DIR"
-tmux pipe-pane -t qa-agent -o "cat >> $HOME/.qa-agent/claude.log"
-tmux send-keys -t qa-agent "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
-say "claude launched (interactive yolo) in tmux session 'qa-agent' (prompt at $PROMPT_FILE)"
+TMUX_SESSION="claude-auto"
+tmux new-session -d -s "$TMUX_SESSION" -c "$START_DIR"
+tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $HOME/.qa-agent/claude.log"
+tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
+say "claude launched (interactive yolo) in tmux session '$TMUX_SESSION' (prompt at $PROMPT_FILE; codespaces UI will rename to claude-<tabId> on first attach)"
 
 # Mirror claudeAIAutoStart's behaviour: nudge the backend with WORKING so the
 # session UI doesn't sit on "idle" until the first hook event fires.
