@@ -130,59 +130,6 @@ else
   echo '{"skipDangerousModePermissionPrompt": true}' | jq . > "$CLAUDE_SETTINGS"
 fi
 
-# ---------- Register qa-agent MCP server -----------------------------------
-# claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
-# script, so `claude` resolves. `claude mcp add --scope user` merges the
-# server entry into ~/.claude.json without disturbing the existing trust /
-# onboarding fields written by claudeAISetup.
-#
-# `ai-qa-agent-cli mcp` runs in-VM and posts CGEvents / invokes
-# `screencapture` locally. TCC matches grants against the *responsible*
-# process in the attribution chain, and this MCP is launched as a
-# descendant of guest-agent (guest-agent → warmup/startup → watcher →
-# tmux → claude → mcp), so the kTCCService{Accessibility,PostEvent,ScreenCapture}
-# grants tccSetup installs against guest-agent at session warmup cover us.
-# See bitrise-codespaces/backend/CLAUDE.md "macOS session VMs — TCC permissions".
-#
-# We also drop any prior `bitrise-dev-environments` registration on the
-# user scope. That MCP is still the right choice for non-QA-Agent dev
-# environments, but this template no longer uses it (the in-VM server here
-# replaces the round-trip through the public Codespaces backend), so a
-# stale entry left over from an older warmup would just clutter the tool
-# list shown to Claude.
-
-if ! command -v claude >/dev/null 2>&1; then
-  log "ERROR: claude CLI not on PATH — Claude credentials must be configured" >&2
-  log "       on the session (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)." >&2
-  exit 1
-elif ! command -v go >/dev/null 2>&1; then
-  log "ERROR: go not on PATH — image is missing Go ≥ 1.25, required to build the MCP server." >&2
-  exit 1
-elif ! command -v swiftc >/dev/null 2>&1; then
-  log "ERROR: swiftc not on PATH — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
-  exit 1
-else
-  # Build the MCP binary up front instead of registering `go run …@latest`.
-  # `go run` rebuilds on every Claude restart and on a cold module cache
-  # downloads + compiles ~50MB of deps before serving stdio — Claude's MCP
-  # client times out and drops the server before the build finishes, which
-  # is why the agent reports "MCP tools aren't registered" on first run.
-  # `go install` pays the cost once during warmup; subsequent registrations
-  # are an exec of a cached binary.
-  log "installing qa-agent MCP binary (one-time, may take ~30s on cold cache)"
-  GOBIN="$HOME/.local/bin" go install github.com/bitrise-io/ai-qa-agent-cli@latest
-  QA_AGENT_BIN="$HOME/.local/bin/ai-qa-agent-cli"
-  if [ ! -x "$QA_AGENT_BIN" ]; then
-    log "ERROR: go install did not produce $QA_AGENT_BIN" >&2
-    exit 1
-  fi
-
-  log "registering qa-agent MCP server (user scope) -> $QA_AGENT_BIN mcp"
-  claude mcp remove --scope user bitrise-dev-environments >/dev/null 2>&1 || true
-  claude mcp remove --scope user qa-agent >/dev/null 2>&1 || true
-  claude mcp add --scope user qa-agent -- "$QA_AGENT_BIN" mcp
-fi
-
 # ---------- Install the upload watcher script ------------------------------
 # startup.sh forks this on every session start. It blocks until the CLI's
 # `--upload` lands inside QA_WATCH_DIR (default /tmp/bitrise-ai-qa-agent),
@@ -190,7 +137,13 @@ fi
 # subdirectory (rather than /tmp at large) means we don't have to filter
 # noise from system temp files or the codespaces backend's own /tmp/.claude_*
 # state — the directory itself is the signal.
+#
+# We install the watcher BEFORE the MCP-server registration below so that
+# any failure in the MCP step still leaves a working watcher on disk —
+# startup.sh fails fast with "watcher missing" otherwise, which masks the
+# real warmup-stage failure.
 
+log "installing upload watcher script"
 mkdir -p "$HOME/.qa-agent"
 cat > "$HOME/.qa-agent/watcher.sh" <<'WATCHEREOF'
 #!/usr/bin/env bash
@@ -312,5 +265,68 @@ if [ -x "$HOME/.claude/notify.sh" ]; then
 fi
 WATCHEREOF
 chmod +x "$HOME/.qa-agent/watcher.sh"
+log "watcher installed at $HOME/.qa-agent/watcher.sh"
 
-log "warmup complete (UDID=$UDID); watcher installed at $HOME/.qa-agent/watcher.sh"
+# ---------- Register qa-agent MCP server -----------------------------------
+# claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
+# script, so `claude` resolves. `claude mcp add --scope user` merges the
+# server entry into ~/.claude.json without disturbing the existing trust /
+# onboarding fields written by claudeAISetup.
+#
+# `ai-qa-agent-cli mcp` runs in-VM and posts CGEvents / invokes
+# `screencapture` locally. TCC matches grants against the *responsible*
+# process in the attribution chain, and this MCP is launched as a
+# descendant of guest-agent (guest-agent → warmup/startup → watcher →
+# tmux → claude → mcp), so the kTCCService{Accessibility,PostEvent,ScreenCapture}
+# grants tccSetup installs against guest-agent at session warmup cover us.
+# See bitrise-codespaces/backend/CLAUDE.md "macOS session VMs — TCC permissions".
+#
+# We `go install` the binary up front instead of registering `go run …@latest`.
+# `go run` would rebuild on every Claude MCP-client start and on a cold module
+# cache downloads + compiles ~50MB of deps before serving stdio — Claude's MCP
+# client times out and drops the server before the build finishes, surfacing
+# as "The MCP tools aren't registered" inside the running agent. `go install`
+# pays the cost once during warmup; subsequent registrations are an exec of
+# a cached binary.
+#
+# We also drop any prior `bitrise-dev-environments` registration on the user
+# scope. That MCP is still the right choice for non-QA-Agent dev environments,
+# but this template no longer uses it (the in-VM server here replaces the
+# round-trip through the public Codespaces backend), so a stale entry from an
+# older warmup would just clutter the tool list shown to Claude.
+
+if ! command -v claude >/dev/null 2>&1; then
+  log "ERROR: claude CLI not on PATH — Claude credentials must be configured" >&2
+  log "       on the session (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)." >&2
+  exit 1
+elif ! command -v go >/dev/null 2>&1; then
+  log "ERROR: go not on PATH — image is missing Go ≥ 1.25, required to build the MCP server." >&2
+  exit 1
+elif ! command -v swiftc >/dev/null 2>&1; then
+  log "ERROR: swiftc not on PATH — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
+  exit 1
+fi
+
+log "go install github.com/bitrise-io/ai-qa-agent-cli@latest -> \$HOME/.local/bin (one-time, may take ~30s on cold cache)"
+mkdir -p "$HOME/.local/bin"
+INSTALL_LOG="$HOME/.qa-agent/go-install.log"
+if ! GOBIN="$HOME/.local/bin" go install github.com/bitrise-io/ai-qa-agent-cli@latest >"$INSTALL_LOG" 2>&1; then
+  log "ERROR: go install failed; tail of $INSTALL_LOG:" >&2
+  tail -n 30 "$INSTALL_LOG" >&2 || true
+  exit 1
+fi
+QA_AGENT_BIN="$HOME/.local/bin/ai-qa-agent-cli"
+if [ ! -x "$QA_AGENT_BIN" ]; then
+  log "ERROR: go install completed without errors but $QA_AGENT_BIN is missing or not executable" >&2
+  log "       contents of \$HOME/.local/bin:" >&2
+  ls -la "$HOME/.local/bin" >&2 || true
+  exit 1
+fi
+log "go install OK: $QA_AGENT_BIN ($(${QA_AGENT_BIN} --help 2>&1 | head -n 1 || echo 'help failed'))"
+
+log "registering qa-agent MCP server (user scope) -> $QA_AGENT_BIN mcp"
+claude mcp remove --scope user bitrise-dev-environments >/dev/null 2>&1 || true
+claude mcp remove --scope user qa-agent >/dev/null 2>&1 || true
+claude mcp add --scope user qa-agent -- "$QA_AGENT_BIN" mcp
+
+log "warmup complete (UDID=$UDID)"
