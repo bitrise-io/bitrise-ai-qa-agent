@@ -91,8 +91,9 @@ printf '%s\n' "$UDID" > "$UDID_FILE"
 # onboarding fields written by claudeAISetup.
 
 if ! command -v claude >/dev/null 2>&1; then
-  log "WARN: claude CLI not on PATH — skipping MCP registration. The session"
-  log "      probably has no Claude credentials; in-VM agent automation won't run."
+  log "ERROR: claude CLI not on PATH — Claude credentials must be configured" >&2
+  log "       on the session (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)." >&2
+  exit 1
 elif [ -z "${BITRISE_TOKEN:-}" ] || [ -z "${BITRISE_WORKSPACE_ID:-}" ]; then
   log "ERROR: BITRISE_TOKEN / BITRISE_WORKSPACE_ID not set as template variables." >&2
   log "       The in-VM agent cannot drive the session without them." >&2
