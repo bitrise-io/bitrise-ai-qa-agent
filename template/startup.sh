@@ -50,12 +50,16 @@ log "using Xcode ${XCODE_VERSION} at $XCODE_PATH"
 # ---------- Fork the upload watcher ----------------------------------------
 # Detached from this script's process tree (setsid + nohup) so it survives
 # after startup.sh returns and the parent inner-script transitions into
-# `sleep 2147483647`. The watcher inherits QA_PROMPT and PATH from this env.
+# `sleep 2147483647`. The watcher inherits AI_PROMPT and PATH from this env.
+#
+# AI_PROMPT comes from session.AiPrompt (set by the CLI). When it's set,
+# the codespaces backend's claudeAIAutoStart ALSO fires at the end of
+# warmup and creates a competing claude-auto running plain `claude`; the
+# watcher's first job is to kill+recreate that session in yolo mode.
 
 WATCHER="$HOME/.qa-agent/watcher.sh"
-if [ -z "${QA_PROMPT:-}" ]; then
-  log "WARN: QA_PROMPT not set — watcher will not be started; the session will"
-  log "      reach RUNNING but no Claude run will fire on upload."
+if [ -z "${AI_PROMPT:-}" ]; then
+  log "WARN: AI_PROMPT not set — watcher will not start. Did the CLI forget to set ai_prompt? The session will reach RUNNING but no QA run will fire."
 elif [ ! -x "$WATCHER" ]; then
   log "ERROR: $WATCHER missing or not executable — warmup did not complete." >&2
   exit 1
@@ -68,5 +72,5 @@ else
     nohup bash "$WATCHER" </dev/null >/dev/null 2>&1 &
     disown
   fi
-  log "upload watcher started (pid=$!, log: \$HOME/.qa-agent/watcher.log)"
+  log "upload watcher started (pid=$!, log: \$HOME/.qa-agent/launcher.log)"
 fi
