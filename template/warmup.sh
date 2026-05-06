@@ -222,15 +222,17 @@ PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
 printf '%s' "$QA_PROMPT" > "$PROMPT_FILE"
 
 START_DIR="${SESSION_WORKING_DIR:-$HOME}"
-# Headless yolo: -p prints to stdout and exits when Claude is done; --dangerously-skip-permissions
-# auto-approves every tool call so the run never blocks on a permission prompt
-# (no human is attached to the session). tmux is kept as a wrapper so the run
-# is still observable via SSH `tmux attach -t qa-agent` and so its stdout is
-# captured by tmux's pipe-pane log if enabled.
+# Interactive yolo: --dangerously-skip-permissions auto-approves every tool
+# call so the run never blocks on a permission prompt (no human is attached
+# to approve them). We deliberately drop -p / --print so the agent leaves
+# its conversation rendered in the tmux pane — `tmux attach -t qa-agent`
+# from SSH then shows the live transcript instead of an already-exited shell.
+# pipe-pane still mirrors the rendered pane to ~/.qa-agent/claude.log for
+# offline inspection.
 tmux new-session -d -s qa-agent -c "$START_DIR"
 tmux pipe-pane -t qa-agent -o "cat >> $HOME/.qa-agent/claude.log"
-tmux send-keys -t qa-agent "claude -p --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
-say "claude launched (headless yolo) in tmux session 'qa-agent' (prompt at $PROMPT_FILE)"
+tmux send-keys -t qa-agent "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
+say "claude launched (interactive yolo) in tmux session 'qa-agent' (prompt at $PROMPT_FILE)"
 
 # Mirror claudeAIAutoStart's behaviour: nudge the backend with WORKING so the
 # session UI doesn't sit on "idle" until the first hook event fires.
