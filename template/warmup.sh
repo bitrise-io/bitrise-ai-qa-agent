@@ -48,6 +48,7 @@ mkdir -p "$HOME/.qa-agent/results"
 # prefer DEVELOPER_DIR over `sudo xcode-select -s` so the choice is
 # per-process (no sudo, no global state) and survives session restarts.
 XCODE_PATH=""
+# Exact match first (covers full SemVer requests like 26.3.0).
 for _candidate in \
   "/Applications/Xcode-${XCODE_VERSION}.app" \
   "/Applications/Xcode_${XCODE_VERSION}.app"; do
@@ -55,8 +56,13 @@ for _candidate in \
     XCODE_PATH="$_candidate"; break
   fi
 done
+# Glob fallback: a request like "26.3" should resolve to "Xcode-26.3.0.app"
+# on Bitrise stack images. Highest patch wins via `sort -V`.
 if [ -z "$XCODE_PATH" ]; then
-  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app" >&2
+  XCODE_PATH="$(ls -d "/Applications/Xcode-${XCODE_VERSION}".*.app 2>/dev/null | sort -V | tail -n 1)"
+fi
+if [ -z "$XCODE_PATH" ] || [ ! -d "$XCODE_PATH" ]; then
+  log "ERROR: Xcode ${XCODE_VERSION} not found at /Applications/Xcode-${XCODE_VERSION}.app or /Applications/Xcode-${XCODE_VERSION}.*.app" >&2
   log "       installed: $(ls -d /Applications/Xcode*.app 2>/dev/null | xargs -n1 basename | tr '\n' ' ')" >&2
   exit 1
 fi
