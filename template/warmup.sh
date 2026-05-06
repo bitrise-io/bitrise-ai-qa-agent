@@ -156,17 +156,31 @@ if ! command -v claude >/dev/null 2>&1; then
   log "       on the session (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)." >&2
   exit 1
 elif ! command -v go >/dev/null 2>&1; then
-  log "ERROR: go not on PATH — image is missing Go ≥ 1.25, required to run the MCP server." >&2
+  log "ERROR: go not on PATH — image is missing Go ≥ 1.25, required to build the MCP server." >&2
   exit 1
 elif ! command -v swiftc >/dev/null 2>&1; then
   log "ERROR: swiftc not on PATH — DEVELOPER_DIR=$DEVELOPER_DIR appears broken." >&2
   exit 1
 else
-  log "registering qa-agent MCP server (user scope)"
+  # Build the MCP binary up front instead of registering `go run …@latest`.
+  # `go run` rebuilds on every Claude restart and on a cold module cache
+  # downloads + compiles ~50MB of deps before serving stdio — Claude's MCP
+  # client times out and drops the server before the build finishes, which
+  # is why the agent reports "MCP tools aren't registered" on first run.
+  # `go install` pays the cost once during warmup; subsequent registrations
+  # are an exec of a cached binary.
+  log "installing qa-agent MCP binary (one-time, may take ~30s on cold cache)"
+  GOBIN="$HOME/.local/bin" go install github.com/bitrise-io/ai-qa-agent-cli@latest
+  QA_AGENT_BIN="$HOME/.local/bin/ai-qa-agent-cli"
+  if [ ! -x "$QA_AGENT_BIN" ]; then
+    log "ERROR: go install did not produce $QA_AGENT_BIN" >&2
+    exit 1
+  fi
+
+  log "registering qa-agent MCP server (user scope) -> $QA_AGENT_BIN mcp"
   claude mcp remove --scope user bitrise-dev-environments >/dev/null 2>&1 || true
   claude mcp remove --scope user qa-agent >/dev/null 2>&1 || true
-  claude mcp add --scope user qa-agent \
-    -- go run github.com/bitrise-io/ai-qa-agent-cli@latest mcp
+  claude mcp add --scope user qa-agent -- "$QA_AGENT_BIN" mcp
 fi
 
 # ---------- Install the upload watcher script ------------------------------
