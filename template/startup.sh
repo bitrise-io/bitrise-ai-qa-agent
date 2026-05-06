@@ -5,46 +5,30 @@
 # archived session). Sits between `claudeAISetup` (refresh creds) and the
 # backend's terminal sleep loop.
 #
-# Performed work:
-#   1. Boot the simulator created by warmup.sh.
-#   2. Publish a known-path manifest with { udid, session_id } so MCP tools
-#      and the prompt can target *this* session.
-#   3. Fork the upload watcher (installed by warmup.sh): it blocks until the
-#      CLI's `--upload` lands in /tmp, then launches Claude in tmux with
-#      $QA_PROMPT. We do NOT use the codespaces backend's claudeAIAutoStart
-#      path here — that fires immediately at warmup with $AI_PROMPT, which
-#      means Claude burns tokens polling for the file from inside its own
-#      loop. Instead, the CLI passes the prompt as a $QA_PROMPT session input
-#      (with expose_as_env_var=true) and we launch Claude only once there's
-#      something to act on.
-#
-# The QA_PROMPT should look something like:
-#
-#   You are a QA tester. The app is at $(cat ~/.qa-agent/upload-path).
-#   Read /tmp/.qa-agent-info.json for { udid, session_id }.
-#   Install: xcrun simctl install <udid> <upload-path>
-#   Launch the app, then drive it with the qa-agent MCP tools
-#   (qa_screenshot, qa_click, qa_scroll) to verify <task>.
-#   Report results, then exit.
+# Startup is intentionally minimal: pick the Xcode (so DEVELOPER_DIR is in
+# the env the watcher inherits), then fork the watcher detached. All
+# simulator handling — waiting for the background `simctl create` started by
+# warmup.sh, booting it, bootstatus, and writing /tmp/.qa-agent-info.json —
+# is now the watcher's job. That keeps startup off the critical path so the
+# session reaches RUNNING in seconds even if the simulator is still
+# initializing in the background.
 
 set -euo pipefail
 
 log() { echo "[qa-agent startup] $*"; }
 
 XCODE_VERSION="${XCODE_VERSION:-26.3}"
-UDID_FILE="$HOME/.qa-agent-simulator-udid"
-INFO_FILE="/tmp/.qa-agent-info.json"
 
 if [ "$(uname)" != "Darwin" ]; then
   log "ERROR: QA Agent template only supports macOS sessions." >&2
   exit 1
 fi
 
-# Match warmup.sh: pick the same Xcode for every simctl call so the version
-# the simulator was created against is the version we boot it with. Bitrise
-# images install Xcode under /Applications/Xcode-${MAJOR.MINOR.PATCH}.app —
-# fall back to a `Xcode-${MAJOR.MINOR}.*.app` glob so a request like "26.3"
-# resolves to "Xcode-26.3.0.app" (highest patch wins).
+# Match warmup.sh: pick the same Xcode so the watcher's simctl calls hit
+# the version the simulator was created against. Bitrise images install
+# Xcode under /Applications/Xcode-${MAJOR.MINOR.PATCH}.app — fall back to a
+# `Xcode-${MAJOR.MINOR}.*.app` glob so a request like "26.3" resolves to
+# "Xcode-26.3.0.app" (highest patch wins).
 XCODE_PATH=""
 for _candidate in \
   "/Applications/Xcode-${XCODE_VERSION}.app" \
@@ -62,84 +46,6 @@ if [ -z "$XCODE_PATH" ] || [ ! -d "$XCODE_PATH" ]; then
 fi
 export DEVELOPER_DIR="$XCODE_PATH/Contents/Developer"
 log "using Xcode ${XCODE_VERSION} at $XCODE_PATH"
-
-if [ ! -s "$UDID_FILE" ]; then
-  log "ERROR: $UDID_FILE missing — warmup.sh did not run successfully." >&2
-  exit 1
-fi
-UDID="$(tr -d '[:space:]' < "$UDID_FILE")"
-
-# ---------- Kick off the simulator boot (non-blocking) ---------------------
-# We deliberately do NOT call `xcrun simctl bootstatus -b` here. That blocks
-# until the simulator is fully booted (springboard ready), which on a fresh
-# image cold-boot can take minutes — and until startup.sh returns, the
-# codespaces backend can't transition the session to RUNNING. The watcher
-# (forked below) waits for that full boot right before it launches Claude,
-# overlapping the boot wait with the upload wait.
-
-current_state() {
-  xcrun simctl list devices -j | /usr/bin/python3 -c "
-import json, sys
-udid = '$UDID'
-for devs in json.load(sys.stdin)['devices'].values():
-    for d in devs:
-        if d['udid'] == udid:
-            print(d.get('state', 'Unknown')); sys.exit()
-print('NotFound')
-"
-}
-
-state="$(current_state)"
-case "$state" in
-  Booted)
-    log "simulator $UDID already booted"
-    ;;
-  Booting)
-    log "simulator $UDID already booting — leaving it to finish in the background"
-    ;;
-  Shutdown | Shutting\ Down)
-    log "issuing async boot for simulator $UDID (state=$state)"
-    xcrun simctl boot "$UDID" 2>/dev/null || true
-    ;;
-  NotFound)
-    log "ERROR: simulator $UDID not registered with simctl — was the device deleted?" >&2
-    exit 1
-    ;;
-  *)
-    log "simulator in unexpected state '$state', issuing boot anyway"
-    xcrun simctl boot "$UDID" 2>/dev/null || true
-    ;;
-esac
-
-# ---------- Publish manifest for the prompt --------------------------------
-# session_id is parsed out of the backend-injected webhook URL, which has the
-# shape `<base>/v1/machines/sessions/<session_id>/notifications` (see
-# bitrise-codespaces session_start.go:309). It's the only env var that
-# carries the session ID into the script.
-
-SESSION_ID=""
-if [ -n "${CODESPACES_NOTIFICATIONS_URL:-}" ]; then
-  SESSION_ID="$(printf '%s' "$CODESPACES_NOTIFICATIONS_URL" \
-    | sed -n 's|.*/sessions/\([^/]*\)/notifications.*|\1|p')"
-fi
-
-if [ -z "$SESSION_ID" ]; then
-  log "WARN: could not derive session_id from CODESPACES_NOTIFICATIONS_URL"
-  log "      ('${CODESPACES_NOTIFICATIONS_URL:-<unset>}'); MCP tools will need"
-  log "      it passed explicitly via the AI prompt."
-fi
-
-umask 077
-/usr/bin/python3 - "$UDID" "$SESSION_ID" > "$INFO_FILE" <<'PY'
-import json, sys
-udid, session_id = sys.argv[1], sys.argv[2]
-print(json.dumps({
-    "udid": udid,
-    "session_id": session_id,
-}, indent=2))
-PY
-
-log "simulator ready (UDID=$UDID); manifest at $INFO_FILE"
 
 # ---------- Fork the upload watcher ----------------------------------------
 # Detached from this script's process tree (setsid + nohup) so it survives

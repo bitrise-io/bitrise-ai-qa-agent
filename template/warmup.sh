@@ -108,22 +108,51 @@ PY
   log "using runtime (highest available): $RUNTIME_ID"
 fi
 
-# ---------- Create the simulator device ------------------------------------
-# Warmup runs once per VM — there's no prior `bitrise-qa-agent` simulator to
-# reuse on this VM's persistent disk, so we skip the existence check and
-# `simctl create` straight away. This collapses two simctl calls into one,
-# which matters because the FIRST simctl invocation under a freshly-set
-# DEVELOPER_DIR pays for CoreSimulator's first-launch (license accept,
-# runtime catalog load). On a beta or non-default Xcode that's minutes;
-# on a pre-warmed system-default Xcode it's seconds. Doing only `create`
-# means the wait is paid by the operation we actually want, not a discovery
-# call that we then throw away.
+# ---------- Background the simulator device creation -----------------------
+# `simctl create` is the FIRST xcrun call under the freshly-set DEVELOPER_DIR,
+# which pays for CoreSimulator's first-launch (license accept, runtime
+# catalog load). On a non-default or beta Xcode that wait is minutes — and
+# until warmup returns, the codespaces backend cannot transition the session
+# to RUNNING.
+#
+# Move the wait off the critical path: write a tiny helper script that runs
+# `simctl create` and parks the resulting UDID + exit code in known files,
+# then fork it detached. Warmup proceeds (watcher install + MCP install),
+# the session reaches RUNNING quickly, and the watcher (which already waits
+# for the upload to land) pays for the simulator wait in parallel — usually
+# overlapping with the upload itself. The user only sees a single end-to-end
+# wait instead of "warmup wait" + "upload wait" serialized.
 
-log "creating simulator $SIM_NAME ($DEVICE_TYPE / $RUNTIME_ID) — first xcrun call under DEVELOPER_DIR=$DEVELOPER_DIR, may stall on CoreSimulator first-launch on a non-default Xcode"
-UDID="$(xcrun simctl create "$SIM_NAME" "$DEVICE_TYPE" "$RUNTIME_ID")"
-log "created simulator: $UDID"
+mkdir -p "$HOME/.qa-agent"
+SIM_CREATE_SCRIPT="$HOME/.qa-agent/create-simulator.sh"
+SIM_CREATE_EXIT="$HOME/.qa-agent/sim-create.exit"
+SIM_CREATE_LOG="$HOME/.qa-agent/sim-create.log"
+rm -f "$SIM_CREATE_EXIT" "$UDID_FILE"
+cat > "$SIM_CREATE_SCRIPT" <<CREATEEOF
+#!/usr/bin/env bash
+# Forked from warmup.sh. Inherits DEVELOPER_DIR + PATH from the parent.
+set -u
+exec >>"$SIM_CREATE_LOG" 2>&1
+echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] simctl create $SIM_NAME ($DEVICE_TYPE / $RUNTIME_ID) under DEVELOPER_DIR=\$DEVELOPER_DIR"
+if UDID="\$(xcrun simctl create '$SIM_NAME' '$DEVICE_TYPE' '$RUNTIME_ID')" && [ -n "\$UDID" ]; then
+  printf '%s\n' "\$UDID" > "$UDID_FILE"
+  echo 0 > "$SIM_CREATE_EXIT"
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] OK \$UDID"
+else
+  RC=\$?
+  echo "\$RC" > "$SIM_CREATE_EXIT"
+  echo "[\$(date '+%Y-%m-%d %H:%M:%S UTC')] FAILED rc=\$RC"
+fi
+CREATEEOF
+chmod +x "$SIM_CREATE_SCRIPT"
 
-printf '%s\n' "$UDID" > "$UDID_FILE"
+log "forking simctl create in background (CoreSimulator first-launch overlaps with watcher install + MCP install + upload)"
+if command -v setsid >/dev/null 2>&1; then
+  setsid nohup bash "$SIM_CREATE_SCRIPT" </dev/null >/dev/null 2>&1 &
+else
+  nohup bash "$SIM_CREATE_SCRIPT" </dev/null >/dev/null 2>&1 &
+  disown
+fi
 
 # ---------- Pre-accept Claude's bypass-permissions consent dialog ----------
 # `claude --dangerously-skip-permissions` shows a one-time interactive
@@ -206,7 +235,37 @@ fi
 
 say "watcher pid=$$, watching $WATCH_DIR, timeout=${TIMEOUT_SEC}s"
 
-# Phase 1: wait for the directory to exist and contain at least one file.
+# Phase 0: wait for the background `simctl create` (kicked off by warmup) to
+# finish. The exit-code file is the rendezvous point. We do this BEFORE the
+# upload wait so a bad sim-create surfaces fast even on slow uploads.
+SIM_UDID_FILE="$HOME/.qa-agent-simulator-udid"
+SIM_CREATE_EXIT="$HOME/.qa-agent/sim-create.exit"
+DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
+say "waiting for background simctl create"
+while true; do
+  if [ -s "$SIM_CREATE_EXIT" ]; then
+    SIM_RC="$(tr -d '[:space:]' < "$SIM_CREATE_EXIT")"
+    if [ "$SIM_RC" = "0" ] && [ -s "$SIM_UDID_FILE" ]; then
+      break
+    fi
+    say "ERROR: background simctl create failed (rc=$SIM_RC). See $HOME/.qa-agent/sim-create.log"
+    exit 1
+  fi
+  if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+    say "ERROR: timed out waiting for sim-create after ${TIMEOUT_SEC}s; tail of $HOME/.qa-agent/sim-create.log:"
+    tail -n 20 "$HOME/.qa-agent/sim-create.log" 2>/dev/null || true
+    exit 1
+  fi
+  sleep "$POLL_SEC"
+done
+SIM_UDID="$(tr -d '[:space:]' < "$SIM_UDID_FILE")"
+say "simulator created: $SIM_UDID"
+
+# Kick the simulator boot off NOW (non-blocking) so it warms while we wait
+# for the upload. We bootstatus -b later, after the upload arrives.
+xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
+
+# Phase 1: wait for the upload directory to exist and contain at least one file.
 DEADLINE=$(( $(date +%s) + TIMEOUT_SEC ))
 while true; do
   if [ "$(date +%s)" -ge "$DEADLINE" ]; then
@@ -234,22 +293,36 @@ while true; do
 done
 say "upload stabilized at ${CURR} bytes total across $(dir_file_count) file(s)"
 
-# Phase 3: ensure the simulator is fully booted before Claude tries to
-# install / launch the app. startup.sh kicked off the boot asynchronously
-# so the session could reach RUNNING quickly; we pay the wait here, where
-# it overlaps with whatever Claude is about to do anyway.
-SIM_UDID_FILE="$HOME/.qa-agent-simulator-udid"
-if [ -s "$SIM_UDID_FILE" ]; then
-  SIM_UDID="$(tr -d '[:space:]' < "$SIM_UDID_FILE")"
-  say "waiting for simulator $SIM_UDID to finish booting"
-  if ! xcrun simctl bootstatus "$SIM_UDID" -b; then
-    say "WARN: bootstatus failed; attempting one shutdown + reboot"
-    xcrun simctl shutdown "$SIM_UDID" 2>/dev/null || true
-    xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
-    xcrun simctl bootstatus "$SIM_UDID" -b || say "WARN: simulator still not ready; Claude will see this if it tries to install"
-  fi
-  say "simulator $SIM_UDID booted"
+# Phase 3: simulator must be fully booted before Claude tries to install the app.
+say "waiting for simulator $SIM_UDID to finish booting"
+if ! xcrun simctl bootstatus "$SIM_UDID" -b; then
+  say "WARN: bootstatus failed; attempting one shutdown + reboot"
+  xcrun simctl shutdown "$SIM_UDID" 2>/dev/null || true
+  xcrun simctl boot "$SIM_UDID" 2>/dev/null || true
+  xcrun simctl bootstatus "$SIM_UDID" -b || say "WARN: simulator still not ready; Claude will see this if it tries to install"
 fi
+say "simulator $SIM_UDID booted"
+
+# Phase 4: publish the manifest the prompt reads. session_id comes from
+# CODESPACES_NOTIFICATIONS_URL (the only backend-injected env var that
+# carries it). We move this into the watcher so startup.sh doesn't depend
+# on the simulator existing yet.
+INFO_FILE="/tmp/.qa-agent-info.json"
+SESSION_ID=""
+if [ -n "${CODESPACES_NOTIFICATIONS_URL:-}" ]; then
+  SESSION_ID="$(printf '%s' "$CODESPACES_NOTIFICATIONS_URL" \
+    | sed -n 's|.*/sessions/\([^/]*\)/notifications.*|\1|p')"
+fi
+if [ -z "$SESSION_ID" ]; then
+  say "WARN: could not derive session_id from CODESPACES_NOTIFICATIONS_URL; the prompt will need it passed explicitly."
+fi
+umask 077
+/usr/bin/python3 - "$SIM_UDID" "$SESSION_ID" > "$INFO_FILE" <<'PY'
+import json, sys
+udid, session_id = sys.argv[1], sys.argv[2]
+print(json.dumps({"udid": udid, "session_id": session_id}, indent=2))
+PY
+say "manifest at $INFO_FILE"
 
 # Persist the resolved upload directory so the prompt / Claude can refer to
 # it without re-doing the discovery dance.
