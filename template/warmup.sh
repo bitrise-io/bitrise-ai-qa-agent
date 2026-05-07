@@ -155,7 +155,7 @@ else
 fi
 
 # ---------- Pre-configure Claude for headless yolo runs --------------------
-# Two settings:
+# Three settings:
 #   skipDangerousModePermissionPrompt=true — suppresses the one-time "Yes, I
 #     accept Bypass Permissions mode" interactive consent dialog
 #     (see GQ() in the claude binary).
@@ -167,13 +167,30 @@ fi
 #     permission prompts and we have to race it with a kill+recreate from
 #     our launcher. With it set, claudeAIAutoStart's session is already
 #     yolo and our launcher just needs to attach pipe-pane for log capture.
+#   hooks.Stop[] += { command: "touch ~/.qa-agent/claude-exited" } — fires
+#     when Claude ends its turn. The watcher's wait-loop watches for that
+#     sentinel and then runs upload-results.sh. We can't rely on the tmux
+#     session dying or on `; touch` chaining via send-keys: in the case the
+#     codespaces backend's claudeAIAutoStart already started claude, we
+#     don't control the command, and claude tends to drop into an
+#     interactive prompt after the task instead of exiting cleanly.
 #
 # claudeAIHooksSetup runs *after* this script and only touches .hooks.*
-# via jq, so these top-level fields survive.
+# via jq merge, so the top-level fields AND our additive hook entry both
+# survive (claudeAIHooksSetup appends its own hook entries; ours stay).
 
 mkdir -p "$HOME/.claude"
 CLAUDE_SETTINGS="$HOME/.claude/settings.json"
-_SETTINGS_PATCH='{skipDangerousModePermissionPrompt: true, permissions: ((.permissions // {}) + {defaultMode: "bypassPermissions"})}'
+_SETTINGS_PATCH='{
+  skipDangerousModePermissionPrompt: true,
+  permissions: ((.permissions // {}) + {defaultMode: "bypassPermissions"}),
+  hooks: ((.hooks // {}) + {
+    Stop: (((.hooks // {}).Stop // []) + [{
+      matcher: "*",
+      hooks: [{type: "command", command: "touch \"$HOME/.qa-agent/claude-exited\""}]
+    }])
+  })
+}'
 if [ -f "$CLAUDE_SETTINGS" ] && jq empty "$CLAUDE_SETTINGS" 2>/dev/null; then
   _TMP="$(mktemp)"
   jq ". + $_SETTINGS_PATCH" "$CLAUDE_SETTINGS" > "$_TMP" && mv "$_TMP" "$CLAUDE_SETTINGS"
@@ -350,30 +367,40 @@ if ! command -v tmux >/dev/null 2>&1; then
   exit 1
 fi
 
-TMUX_SESSION="claude-auto"
 CLAUDE_LOG="$HOME/.qa-agent/claude.log"
 CLAUDE_EXITED="$HOME/.qa-agent/claude-exited"
 # Stale sentinel from a previous session restart would fire the upload
 # immediately. Always start clean.
 rm -f "$CLAUDE_EXITED"
 
-if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-  say "$TMUX_SESSION already exists (likely from claudeAIAutoStart). Attaching pipe-pane for log capture only."
+# Find any pre-existing tmux session created by the codespaces backend's
+# claudeAIAutoStart. It was historically named "claude-auto" but the
+# backend now creates it directly with the tab-id-style name (e.g.
+# claude-<uuid>) so the codespaces UI's auto-attach can find it.
+# Match by `claude-` prefix instead of a fixed name to handle both forms.
+TMUX_SESSION="$(tmux list-sessions -F '#{session_name}' 2>/dev/null \
+  | grep -E '^claude-' | head -n 1 || true)"
+
+if [ -n "$TMUX_SESSION" ]; then
+  say "$TMUX_SESSION already exists (claudeAIAutoStart). Attaching pipe-pane for log capture only."
   tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $CLAUDE_LOG"
   # claudeAIAutoStart runs `claude` as the tmux session's main command, so
-  # when claude exits the session dies — the wait loop below uses
-  # `! tmux has-session` as the exit signal in this case.
+  # in principle the session dies when claude exits. In practice claude
+  # often drops into an interactive prompt after the task — so the
+  # ~/.claude/settings.json Stop hook (set up by warmup.sh) is the
+  # primary "claude finished" signal; the wait loop below also breaks if
+  # the tmux session disappears.
 else
-  say "no existing $TMUX_SESSION (warmup didn't re-run? session restart?). Creating one with explicit yolo flag."
+  TMUX_SESSION="claude-auto"
+  say "no existing claude-* tmux session (warmup didn't re-run? session restart?). Creating $TMUX_SESSION with explicit yolo flag."
   PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
   printf '%s' "$AI_PROMPT" > "$PROMPT_FILE"
   START_DIR="${SESSION_WORKING_DIR:-$HOME}"
   tmux new-session -d -s "$TMUX_SESSION" -c "$START_DIR"
   tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $CLAUDE_LOG"
-  # Chain `; touch claude-exited` so we get a local sentinel when Claude
-  # finishes. We don't `exit` after — keeping the shell (and tmux session)
-  # alive lets the user attach for post-run inspection. The wait loop below
-  # uses the sentinel as the exit signal in this case.
+  # Chain `; touch claude-exited` as a *secondary* fallback: the Stop hook
+  # in settings.json is the primary signal; this fires only if claude
+  # exits cleanly out of the shell.
   tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"; touch $CLAUDE_EXITED" Enter
   say "claude launched in tmux session '$TMUX_SESSION' (prompt at $PROMPT_FILE)"
 fi
