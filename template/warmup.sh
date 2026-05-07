@@ -352,10 +352,17 @@ fi
 
 TMUX_SESSION="claude-auto"
 CLAUDE_LOG="$HOME/.qa-agent/claude.log"
+CLAUDE_EXITED="$HOME/.qa-agent/claude-exited"
+# Stale sentinel from a previous session restart would fire the upload
+# immediately. Always start clean.
+rm -f "$CLAUDE_EXITED"
 
 if tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
   say "$TMUX_SESSION already exists (likely from claudeAIAutoStart). Attaching pipe-pane for log capture only."
   tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $CLAUDE_LOG"
+  # claudeAIAutoStart runs `claude` as the tmux session's main command, so
+  # when claude exits the session dies — the wait loop below uses
+  # `! tmux has-session` as the exit signal in this case.
 else
   say "no existing $TMUX_SESSION (warmup didn't re-run? session restart?). Creating one with explicit yolo flag."
   PROMPT_FILE="$(mktemp /tmp/.qa_prompt_XXXXXX)"
@@ -363,7 +370,11 @@ else
   START_DIR="${SESSION_WORKING_DIR:-$HOME}"
   tmux new-session -d -s "$TMUX_SESSION" -c "$START_DIR"
   tmux pipe-pane -t "$TMUX_SESSION" -o "cat >> $CLAUDE_LOG"
-  tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"" Enter
+  # Chain `; touch claude-exited` so we get a local sentinel when Claude
+  # finishes. We don't `exit` after — keeping the shell (and tmux session)
+  # alive lets the user attach for post-run inspection. The wait loop below
+  # uses the sentinel as the exit signal in this case.
+  tmux send-keys -t "$TMUX_SESSION" "claude --dangerously-skip-permissions \"\$(cat $PROMPT_FILE)\"; touch $CLAUDE_EXITED" Enter
   say "claude launched in tmux session '$TMUX_SESSION' (prompt at $PROMPT_FILE)"
 fi
 
@@ -372,9 +383,93 @@ fi
 if [ -x "$HOME/.claude/notify.sh" ]; then
   echo '{}' | "$HOME/.claude/notify.sh" SESSION_NOTIFICATION_TYPE_AGENT_WORKING || true
 fi
+
+# ---------- Wait for Claude to exit, then upload results -------------------
+# After the agent exits, ship its output (~/.qa-agent/results/) to the
+# bitrise-rde-qa-results visualisation service. Authenticates with
+# $BITRISE_PAT, which the CLI forwards as a secret session input on
+# `session create`. If BITRISE_PAT is unset the helper logs and exits 1 —
+# we still log here, but don't fail (nothing else gates on it).
+#
+# Two exit signals — whichever fires first wins:
+#   - $CLAUDE_EXITED file appears  (we created the session via send-keys)
+#   - $TMUX_SESSION goes away      (claudeAIAutoStart created the session,
+#                                   running claude as the session command)
+say "watching for claude exit (sentinel: $CLAUDE_EXITED, tmux: $TMUX_SESSION)"
+while true; do
+  if [ -e "$CLAUDE_EXITED" ]; then
+    say "sentinel $CLAUDE_EXITED appeared"
+    break
+  fi
+  if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    say "tmux session $TMUX_SESSION is gone — claude exited"
+    break
+  fi
+  sleep 5
+done
+say "claude exited; running upload-results.sh"
+if [ -x "$HOME/.qa-agent/upload-results.sh" ]; then
+  "$HOME/.qa-agent/upload-results.sh" || say "upload-results.sh failed (rc=$?); see $HOME/.qa-agent/upload.log"
+else
+  say "WARN: $HOME/.qa-agent/upload-results.sh missing or not executable; skipping upload"
+fi
+say "watcher done"
 WATCHEREOF
 chmod +x "$HOME/.qa-agent/watcher.sh"
 log "wait-for-deps and launcher installed in $HOME/.qa-agent/"
+
+# ---------- Install the upload-results helper ------------------------------
+# Called by watcher.sh after Claude exits. Wraps the
+# `ai-qa-agent-cli upload-results` subcommand the CLI installs into
+# $HOME/.local/bin during the MCP setup below. Reads $BITRISE_PAT from the
+# environment (forwarded by the CLI as a secret session input).
+cat > "$HOME/.qa-agent/upload-results.sh" <<'UPLOADEOF'
+#!/usr/bin/env bash
+# Tar ~/.qa-agent/results/ and POST it to bitrise-rde-qa-results, then
+# print the resulting URL to the upload log.
+set -u
+
+LOG="$HOME/.qa-agent/upload.log"
+exec >>"$LOG" 2>&1
+
+ts() { date '+%Y-%m-%d %H:%M:%S UTC'; }
+say() { echo "[$(ts)] [upload] $*"; }
+
+RESULTS_DIR="$HOME/.qa-agent/results"
+QA_AGENT_BIN="$HOME/.local/bin/ai-qa-agent-cli"
+
+if [ -z "${BITRISE_PAT:-}" ]; then
+  say "ERROR: BITRISE_PAT is unset. The CLI forwards it as a secret session input on `session create`; verify the session was created with a CLI version that does this, or pass --secret-input BITRISE_PAT=… explicitly."
+  exit 1
+fi
+if [ ! -d "$RESULTS_DIR" ]; then
+  say "ERROR: $RESULTS_DIR does not exist; nothing to upload."
+  exit 1
+fi
+if [ ! -x "$QA_AGENT_BIN" ]; then
+  say "ERROR: $QA_AGENT_BIN missing or not executable. Did warmup.sh's go install fail?"
+  exit 1
+fi
+
+# Mirror what ai-qa-agent-cli session collect does locally: copy the agent's
+# log into the results dir so it's part of the upload (and shows up as a
+# JUnit attachment on the visualisation page).
+if [ -f "$HOME/.qa-agent/claude.log" ] && [ ! -e "$RESULTS_DIR/claude.log" ]; then
+  cp "$HOME/.qa-agent/claude.log" "$RESULTS_DIR/claude.log" || true
+fi
+
+say "uploading $RESULTS_DIR -> ${BITRISE_RDE_QA_RESULTS_URL:-https://rde-qa-results.services.bitrise.dev/api/results}"
+# upload-results prints the absolute URL on stdout on success.
+URL="$("$QA_AGENT_BIN" upload-results "$RESULTS_DIR")"
+RC=$?
+if [ $RC -ne 0 ]; then
+  say "ERROR: ai-qa-agent-cli upload-results exited $RC"
+  exit $RC
+fi
+say "uploaded: $URL"
+UPLOADEOF
+chmod +x "$HOME/.qa-agent/upload-results.sh"
+log "upload-results helper installed at $HOME/.qa-agent/upload-results.sh"
 
 # ---------- Register qa-agent MCP server -----------------------------------
 # claudeAISetup has already exported PATH=$HOME/.local/bin:$PATH for this
